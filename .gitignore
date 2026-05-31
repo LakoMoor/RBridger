@@ -1,4 +1,8 @@
 /target
 /log
 token
-*.json
+ui-cfg.json
+dist/out/
+.DS_Store
+**/.DS_Store
+*.onnx
