@@ -79,6 +79,7 @@ struct Config {
     source:         Option<TrackingSource>,
     expr_app_port:  Option<u16>,
     webcam_index:   Option<u32>,
+    start_tab:      Option<String>,
 }
 
 impl Config {
@@ -342,7 +343,12 @@ impl App {
             #[cfg(feature = "webcam")]
             webcam_lmks:       vec![],
             show_preview:      false,
-            tab:             Tab::Bridge,
+            tab: match cfg.start_tab.as_deref() {
+                Some("config")   => Tab::Config,
+                Some("settings") => Tab::Settings,
+                Some("about")    => Tab::About,
+                _                => Tab::Bridge,
+            },
             active:          Arc::new(AtomicBool::new(false)),
             vts_connected:   Arc::new(AtomicBool::new(false)),
             pending_path:    None,

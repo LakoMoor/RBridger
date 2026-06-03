@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RBridger — Free VTube Studio face tracking bridge</title>
+<meta name="description" content="Free, open-source alternative to VBridger. Bridges iPhone ARKit tracking and webcam neural tracking to VTube Studio.">
+<style>
+  :root {
+    --bg:      #0d0d0f;
+    --bg2:     #16161a;
+    --bg3:     #1e1e24;
+    --border:  #2a2a35;
+    --text:    #e0e0e8;
+    --muted:   #888899;
+    --accent:  #3c8dff;
+    --accent2: #5cb85c;
+    --yellow:  #dcb940;
+    --red:     #c83c3c;
+    --radius:  10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; line-height: 1.6; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ── Nav ── */
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,13,15,.92); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 2rem; height: 52px;
+  }
+  .nav-logo { font-weight: 700; font-size: 1.1rem; color: var(--text); display: flex; align-items: center; gap: .5rem; }
+  .nav-logo img { width: 24px; height: 24px; border-radius: 5px; }
+  .nav-links { display: flex; gap: 1.5rem; }
+  .nav-links a { color: var(--muted); font-size: .9rem; }
+  .nav-links a:hover { color: var(--text); text-decoration: none; }
+
+  /* ── Hero ── */
+  .hero {
+    max-width: 860px; margin: 0 auto; padding: 5rem 1.5rem 4rem;
+    text-align: center;
+  }
+  .hero-badge {
+    display: inline-flex; align-items: center; gap: .5rem;
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 999px; padding: .3rem .9rem; font-size: .8rem;
+    color: var(--muted); margin-bottom: 1.4rem;
+  }
+  .hero h1 { font-size: clamp(2.2rem, 6vw, 3.6rem); font-weight: 800; letter-spacing: -.02em; margin-bottom: .8rem; }
+  .hero h1 span { color: var(--accent); }
+  .hero .sub { font-size: 1.15rem; color: var(--muted); max-width: 560px; margin: 0 auto 2rem; }
+  .btn-row { display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; margin-bottom: 2.2rem; }
+  .btn {
+    display: inline-flex; align-items: center; gap: .45rem;
+    padding: .65rem 1.4rem; border-radius: var(--radius); font-size: .95rem; font-weight: 600; cursor: pointer; border: none; transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; text-decoration: none; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .badges { display: flex; gap: .6rem; justify-content: center; flex-wrap: wrap; }
+  .badges img { height: 20px; }
+
+  /* ── Sections ── */
+  section { max-width: 960px; margin: 0 auto; padding: 3.5rem 1.5rem; }
+  .section-title { font-size: 1.5rem; font-weight: 700; margin-bottom: .4rem; }
+  .section-sub { color: var(--muted); margin-bottom: 2rem; }
+  hr.dim { border: none; border-top: 1px solid var(--border); }
+
+  /* ── Status bar ── */
+  #status-bar {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+    display: flex; gap: 2rem; padding: 1rem 1.5rem; flex-wrap: wrap; margin-bottom: 3rem;
+  }
+  .status-item { display: flex; flex-direction: column; gap: .2rem; }
+  .status-label { font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .status-value { font-size: .95rem; font-weight: 600; display: flex; align-items: center; gap: .4rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .dot-green  { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); }
+  .dot-yellow { background: var(--yellow);  box-shadow: 0 0 6px var(--yellow); }
+  .dot-red    { background: var(--red);     box-shadow: 0 0 6px var(--red); }
+  .dot-grey   { background: var(--muted); }
+
+  /* ── Screenshots ── */
+  .screenshots-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.2rem;
+  }
+  .shot-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+    transition: border-color .2s, transform .15s;
+    cursor: pointer;
+  }
+  .shot-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .shot-card img { width: 100%; display: block; }
+  .shot-label { padding: .6rem .9rem; font-size: .8rem; color: var(--muted); font-weight: 500; }
+
+  /* ── Lightbox ── */
+  #lightbox {
+    display: none; position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,.85); align-items: center; justify-content: center;
+    padding: 1rem;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img { max-width: min(900px, 95vw); max-height: 90vh; border-radius: var(--radius); box-shadow: 0 20px 80px #000; }
+  #lightbox-close { position: absolute; top: 1rem; right: 1.2rem; color: #fff; font-size: 2rem; cursor: pointer; line-height: 1; }
+
+  /* ── Features ── */
+  .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+  .feat-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 1.2rem 1.3rem;
+  }
+  .feat-icon { font-size: 1.5rem; margin-bottom: .6rem; }
+  .feat-title { font-weight: 600; margin-bottom: .3rem; }
+  .feat-desc { font-size: .88rem; color: var(--muted); }
+
+  /* ── Compare ── */
+  .compare-table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  .compare-table th, .compare-table td { padding: .65rem 1rem; border-bottom: 1px solid var(--border); text-align: left; }
+  .compare-table th { color: var(--muted); font-weight: 500; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+  .compare-table tr:last-child td { border-bottom: none; }
+  .yes { color: var(--accent2); font-weight: 600; }
+  .no  { color: var(--red); }
+  .partial { color: var(--yellow); }
+
+  /* ── Changelog ── */
+  #changelog { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.2rem 1.5rem; }
+  .release-item { padding: .8rem 0; border-bottom: 1px solid var(--border); }
+  .release-item:last-child { border-bottom: none; }
+  .release-tag { font-weight: 700; color: var(--accent); }
+  .release-date { font-size: .8rem; color: var(--muted); margin-left: .5rem; }
+  .release-body { font-size: .88rem; color: var(--muted); margin-top: .35rem; white-space: pre-wrap; }
+
+  /* ── Download ── */
+  .dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+  .dl-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 1.3rem; display: flex; flex-direction: column; gap: .5rem;
+    transition: border-color .2s;
+  }
+  .dl-card:hover { border-color: var(--accent); }
+  .dl-os { font-size: 1.2rem; }
+  .dl-name { font-weight: 600; }
+  .dl-desc { font-size: .82rem; color: var(--muted); }
+  .dl-btn { margin-top: auto; display: inline-block; background: var(--accent); color: #fff; padding: .5rem .9rem; border-radius: 7px; font-size: .88rem; font-weight: 600; text-align: center; }
+  .dl-btn:hover { opacity: .85; text-decoration: none; }
+  .dl-version { font-size: .78rem; color: var(--muted); }
+
+  /* ── Quick start ── */
+  .steps { counter-reset: step; display: flex; flex-direction: column; gap: .9rem; }
+  .step { display: flex; gap: 1rem; align-items: flex-start; }
+  .step-num {
+    counter-increment: step; content: counter(step);
+    background: var(--bg3); border: 1px solid var(--border);
+    width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-size: .8rem; font-weight: 700; flex-shrink: 0; color: var(--accent); margin-top: .1rem;
+  }
+  .step-num::before { content: counter(step); }
+  .step-text { padding-top: .05rem; }
+
+  /* ── Footer ── */
+  footer {
+    border-top: 1px solid var(--border); padding: 2rem 1.5rem;
+    text-align: center; color: var(--muted); font-size: .85rem;
+  }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 600px) {
+    nav { padding: 0 1rem; }
+    .hero { padding: 3rem 1rem 2.5rem; }
+    .nav-links { gap: 1rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <a class="nav-logo" href="#">
+    <img src="https://raw.githubusercontent.com/LakoMoor/RBridger/master/ui/resources/rb128.png" alt="RBridger icon">
+    RBridger
+  </a>
+  <div class="nav-links">
+    <a href="#screenshots">Screenshots</a>
+    <a href="#features">Features</a>
+    <a href="#download">Download</a>
+    <a href="https://github.com/LakoMoor/RBridger" target="_blank">GitHub</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<div class="hero">
+  <div class="hero-badge">🦀 Built with Rust &amp; egui</div>
+  <h1>Face tracking bridge<br>for <span>VTube Studio</span></h1>
+  <p class="sub">Free, open-source alternative to VBridger. Supports iPhone ARKit (50+ blend shapes) and webcam neural tracking.</p>
+  <div class="btn-row">
+    <a id="dl-hero" class="btn btn-primary" href="https://github.com/LakoMoor/RBridger/releases/latest">
+      ⬇ Download latest
+    </a>
+    <a class="btn btn-outline" href="https://github.com/LakoMoor/RBridger" target="_blank">
+      ★ View on GitHub
+    </a>
+  </div>
+  <div class="badges">
+    <a href="https://github.com/LakoMoor/RBridger/actions/workflows/release.yml" target="_blank">
+      <img src="https://github.com/LakoMoor/RBridger/actions/workflows/release.yml/badge.svg" alt="CI">
+    </a>
+    <a href="https://github.com/LakoMoor/RBridger/releases/latest" target="_blank">
+      <img id="version-badge" src="https://img.shields.io/github/v/release/LakoMoor/RBridger?style=flat&color=3c8dff&label=latest" alt="Latest release">
+    </a>
+    <img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat" alt="License">
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-888?style=flat" alt="Platforms">
+  </div>
+</div>
+
+<!-- Status bar -->
+<section style="padding-top:0; padding-bottom:1rem;">
+  <div id="status-bar">
+    <div class="status-item">
+      <span class="status-label">Build</span>
+      <span class="status-value" id="ci-status"><span class="dot dot-grey"></span>Loading…</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Latest version</span>
+      <span class="status-value" id="latest-ver">—</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Released</span>
+      <span class="status-value" id="released-at">—</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">License</span>
+      <span class="status-value">GPL-3.0</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Language</span>
+      <span class="status-value">Rust</span>
+    </div>
+  </div>
+</section>
+
+<!-- Screenshots -->
+<section id="screenshots">
+  <div class="section-title">Screenshots</div>
+  <div class="section-sub">RBridger running on macOS — dark theme.</div>
+  <div class="screenshots-grid">
+    <div class="shot-card" onclick="openLightbox(this)">
+      <img src="screenshots/bridge.png" alt="Bridge tab">
+      <div class="shot-label">Bridge — connect iPhone or webcam</div>
+    </div>
+    <div class="shot-card" onclick="openLightbox(this)">
+      <img src="screenshots/config.png" alt="Config tab">
+      <div class="shot-label">Config — transform parameter editor</div>
+    </div>
+    <div class="shot-card" onclick="openLightbox(this)">
+      <img src="screenshots/settings.png" alt="Settings tab">
+      <div class="shot-label">Settings — port, theme, log level</div>
+    </div>
+    <div class="shot-card" onclick="openLightbox(this)">
+      <img src="screenshots/about.png" alt="About tab">
+      <div class="shot-label">About — version &amp; update check</div>
+    </div>
+  </div>
+</section>
+
+<!-- Lightbox -->
+<div id="lightbox" onclick="closeLightbox()">
+  <span id="lightbox-close" onclick="closeLightbox()">×</span>
+  <img id="lightbox-img" src="" alt="">
+</div>
+
+<hr class="dim">
+
+<!-- Features -->
+<section id="features">
+  <div class="section-title">Features</div>
+  <div class="section-sub">Everything you need to route face tracking into VTube Studio.</div>
+  <div class="features-grid">
+    <div class="feat-card">
+      <div class="feat-icon">📱</div>
+      <div class="feat-title">iPhone ARKit tracking</div>
+      <div class="feat-desc">50+ ARKit blend shapes over Wi-Fi — full expression range for jaw, eyes, brows, cheeks, tongue and more.</div>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">📷</div>
+      <div class="feat-title">Webcam neural tracking</div>
+      <div class="feat-desc">ONNX models auto-downloaded on first run (~3 MB). Head pose, eye blink, jaw, brows — no iPhone needed.</div>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">🔧</div>
+      <div class="feat-title">Transform config editor</div>
+      <div class="feat-desc">Map any tracking variable to any VTS parameter with math expressions. Built-in evalexpr with math:: functions.</div>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">🎨</div>
+      <div class="feat-title">Built-in template</div>
+      <div class="feat-desc">33-parameter ovrog.json preset covering all major expressions. One click to load and start tracking.</div>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">🟢</div>
+      <div class="feat-title">3-state status indicator</div>
+      <div class="feat-desc">Red = disconnected, yellow = connecting (auth pending), green = connected and streaming data to VTS.</div>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">🔄</div>
+      <div class="feat-title">Auto-reconnect</div>
+      <div class="feat-desc">Automatically reconnects to VTube Studio if the connection drops. Configurable delay.</div>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">⚡</div>
+      <div class="feat-title">Low overhead</div>
+      <div class="feat-desc">Native Rust binary. Minimal CPU/memory usage compared to Electron or Python-based alternatives.</div>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">🆓</div>
+      <div class="feat-title">Free &amp; open source</div>
+      <div class="feat-desc">GPL-3.0 license. No subscription, no telemetry, no limits. Fork of rusty-bridge by ovROG.</div>
+    </div>
+  </div>
+
+  <!-- Comparison table -->
+  <h3 style="margin: 2.5rem 0 1rem; font-size: 1.1rem;">vs VBridger</h3>
+  <table class="compare-table">
+    <thead>
+      <tr><th>Feature</th><th>RBridger</th><th>VBridger</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>iPhone tracking (ARKit)</td><td class="yes">✓ Full 50+ shapes</td><td class="yes">✓</td></tr>
+      <tr><td>Webcam tracking</td><td class="yes">✓ ONNX neural</td><td class="yes">✓</td></tr>
+      <tr><td>Transform config editor</td><td class="yes">✓ Built-in, formula-based</td><td class="partial">Basic</td></tr>
+      <tr><td>Price</td><td class="yes">Free</td><td class="no">Paid (~$10)</td></tr>
+      <tr><td>Open source</td><td class="yes">✓ GPL-3.0</td><td class="no">✗</td></tr>
+      <tr><td>macOS / Linux / Windows</td><td class="yes">✓ All three</td><td class="partial">Windows / macOS</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<hr class="dim">
+
+<!-- Quick start -->
+<section id="quickstart">
+  <div class="section-title">Quick Start</div>
+  <div class="section-sub">Up and running in under 2 minutes.</div>
+  <div class="steps">
+    <div class="step"><span class="step-num"></span><div class="step-text">Open <strong>VTube Studio</strong> on PC — enable the VTS API in Settings → General → VTube Studio API (port 8001).</div></div>
+    <div class="step"><span class="step-num"></span><div class="step-text"><a href="#download">Download</a> and launch <strong>RBridger</strong> for your platform.</div></div>
+    <div class="step"><span class="step-num"></span><div class="step-text">Go to the <strong>Config</strong> tab → click <kbd>Template</kbd> to load the built-in 33-parameter config, then <kbd>Save</kbd> it.</div></div>
+    <div class="step"><span class="step-num"></span><div class="step-text">Go to the <strong>Bridge</strong> tab → choose <em>iPhone</em> or <em>Webcam</em> → for iPhone, enter your device's local IP address.</div></div>
+    <div class="step"><span class="step-num"></span><div class="step-text">Press <strong>Connect</strong> — VTube Studio will show an auth popup. Accept it. Status turns 🟢 green — you're live!</div></div>
+  </div>
+</section>
+
+<hr class="dim">
+
+<!-- Download -->
+<section id="download">
+  <div class="section-title">Download</div>
+  <div class="section-sub" id="dl-version-label">Latest release — loading…</div>
+  <div class="dl-grid">
+    <div class="dl-card">
+      <div class="dl-os">🍎</div>
+      <div class="dl-name">macOS</div>
+      <div class="dl-desc">macOS 11.0+ (Apple Silicon &amp; Intel). DMG with .app bundle.</div>
+      <a id="dl-macos" class="dl-btn" href="https://github.com/LakoMoor/RBridger/releases/latest">Download DMG</a>
+      <div class="dl-version" id="dl-macos-ver">Loading…</div>
+    </div>
+    <div class="dl-card">
+      <div class="dl-os">🐧</div>
+      <div class="dl-name">Linux</div>
+      <div class="dl-desc">Ubuntu 24.04+, Debian-based. Requires GTK3.</div>
+      <a id="dl-linux" class="dl-btn" href="https://github.com/LakoMoor/RBridger/releases/latest">Download .deb</a>
+      <div class="dl-version" id="dl-linux-ver">Loading…</div>
+    </div>
+    <div class="dl-card">
+      <div class="dl-os">🪟</div>
+      <div class="dl-name">Windows</div>
+      <div class="dl-desc">Windows 10/11 64-bit. NSIS installer.</div>
+      <a id="dl-windows" class="dl-btn" href="https://github.com/LakoMoor/RBridger/releases/latest">Download Setup</a>
+      <div class="dl-version" id="dl-windows-ver">Loading…</div>
+    </div>
+  </div>
+</section>
+
+<hr class="dim">
+
+<!-- Changelog -->
+<section id="changelog">
+  <div class="section-title">Releases</div>
+  <div class="section-sub">Latest releases fetched live from GitHub.</div>
+  <div id="changelog-list">Loading…</div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <p>
+    <strong>RBridger</strong> — fork of <a href="https://github.com/ovROG/rusty-bridge" target="_blank">rusty-bridge</a> by ovROG &nbsp;·&nbsp;
+    Maintained by <a href="https://github.com/LakoMoor" target="_blank">LakoMoor</a> &nbsp;·&nbsp;
+    <a href="https://github.com/LakoMoor/RBridger" target="_blank">GitHub</a> &nbsp;·&nbsp;
+    GPL-3.0
+  </p>
+</footer>
+
+<script>
+const REPO = "LakoMoor/RBridger";
+const API  = `https://api.github.com/repos/${REPO}`;
+
+function relativeTime(iso) {
+  const d = new Date(iso), now = new Date();
+  const diff = (now - d) / 1000;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+  return `${Math.floor(diff/86400)}d ago`;
+}
+
+async function loadRelease() {
+  try {
+    const r = await fetch(`${API}/releases/latest`);
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    const ver  = data.tag_name;
+    const date = relativeTime(data.published_at);
+
+    // Hero / status
+    document.getElementById("latest-ver").textContent = ver;
+    document.getElementById("released-at").textContent = date;
+    document.getElementById("dl-version-label").textContent = `Latest release — ${ver} (${date})`;
+    document.getElementById("dl-hero").textContent = `⬇ Download ${ver}`;
+
+    // CI status (infer from release existing)
+    const ci = document.getElementById("ci-status");
+    ci.innerHTML = `<span class="dot dot-green"></span>Passing`;
+
+    // Per-platform download links
+    const assets = data.assets || [];
+    const dmg  = assets.find(a => a.name.endsWith(".dmg"));
+    const deb  = assets.find(a => a.name.endsWith(".deb"));
+    const exe  = assets.find(a => a.name.endsWith(".exe"));
+
+    if (dmg) {
+      document.getElementById("dl-macos").href = dmg.browser_download_url;
+      document.getElementById("dl-macos").textContent = `Download ${dmg.name}`;
+      document.getElementById("dl-macos-ver").textContent = `${(dmg.size/1024/1024).toFixed(1)} MB`;
+    }
+    if (deb) {
+      document.getElementById("dl-linux").href = deb.browser_download_url;
+      document.getElementById("dl-linux").textContent = `Download ${deb.name}`;
+      document.getElementById("dl-linux-ver").textContent = `${(deb.size/1024/1024).toFixed(1)} MB`;
+    }
+    if (exe) {
+      document.getElementById("dl-windows").href = exe.browser_download_url;
+      document.getElementById("dl-windows").textContent = `Download ${exe.name}`;
+      document.getElementById("dl-windows-ver").textContent = `${(exe.size/1024/1024).toFixed(1)} MB`;
+    }
+  } catch(e) {
+    document.getElementById("ci-status").innerHTML = `<span class="dot dot-grey"></span>N/A`;
+  }
+}
+
+async function loadChangelog() {
+  try {
+    const r = await fetch(`${API}/releases?per_page=5`);
+    if (!r.ok) throw new Error();
+    const releases = await r.json();
+    const el = document.getElementById("changelog-list");
+
+    if (!releases.length) { el.textContent = "No releases yet."; return; }
+
+    const box = document.getElementById("changelog");
+    el.innerHTML = "";
+    for (const rel of releases) {
+      const div = document.createElement("div");
+      div.className = "release-item";
+      const body = (rel.body || "").trim().split("\n").slice(0,6).join("\n");
+      div.innerHTML = `
+        <div>
+          <a class="release-tag" href="${rel.html_url}" target="_blank">${rel.tag_name}</a>
+          <span class="release-date">${new Date(rel.published_at).toLocaleDateString("en-US",{year:"numeric",month:"short",day:"numeric"})}</span>
+        </div>
+        ${body ? `<div class="release-body">${body.replace(/</g,"&lt;")}</div>` : ""}
+      `;
+      el.appendChild(div);
+    }
+  } catch(e) {
+    document.getElementById("changelog-list").textContent = "Could not load releases.";
+  }
+}
+
+function openLightbox(card) {
+  const img = card.querySelector("img");
+  document.getElementById("lightbox-img").src = img.src;
+  document.getElementById("lightbox").classList.add("open");
+}
+function closeLightbox() {
+  document.getElementById("lightbox").classList.remove("open");
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeLightbox(); });
+
+loadRelease();
+loadChangelog();
+</script>
+</body>
+</html>
