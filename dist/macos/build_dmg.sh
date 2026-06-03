@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="RustyBridge"
-VERSION="0.1.0"
-BINARY="rusty-bridge-ui"
+APP_NAME="RBridger"
+VERSION=$(grep '^version' "$(dirname "$0")/../../ui/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
+BINARY="rbridger-ui"
 WORKSPACE_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ICNS="$WORKSPACE_ROOT/ui/resources/rb.icns"
 RELEASE_BIN="$WORKSPACE_ROOT/target/release/$BINARY"
@@ -14,7 +14,7 @@ DMG_PATH="$OUT_DIR/${APP_NAME}-${VERSION}-macos.dmg"
 # Build release binary
 echo "Building release..."
 cd "$WORKSPACE_ROOT"
-cargo build --release -p rusty-bridge-ui
+cargo build --release -p rbridger-ui
 
 # Assemble .app bundle
 rm -rf "$APP_DIR"
@@ -30,9 +30,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleIdentifier</key>         <string>com.ovrog.rustybridge</string>
+  <key>CFBundleIdentifier</key>         <string>com.lakomoor.rbridger</string>
   <key>CFBundleName</key>               <string>$APP_NAME</string>
-  <key>CFBundleDisplayName</key>        <string>Rusty Bridge</string>
+  <key>CFBundleDisplayName</key>        <string>$APP_NAME</string>
   <key>CFBundleExecutable</key>         <string>$APP_NAME</string>
   <key>CFBundleIconFile</key>           <string>AppIcon</string>
   <key>CFBundleVersion</key>            <string>$VERSION</string>
