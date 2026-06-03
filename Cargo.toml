@@ -1,6 +1,6 @@
 [package]
-name = "rusty-bridger"
-version = "0.2.0"
+name = "rbridger"
+version = "0.2.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,7 +11,7 @@ members = [
 ]
 
 [dependencies]
-rusty-bridge-lib = { path = "./vts" }
+rbridger-lib = { path = "./vts" }
 clap = { version = "4.5.16", features = ["derive"] }
 evalexpr = {version = "11.3.0", features = ["rand"]}
 log = "0.4.22"

@@ -54,30 +54,35 @@ impl VtsPhone {
         .to_string();
 
         let mut next_time = time::Instant::now();
+        let mut last_received = time::Instant::now();
 
         while active.load(Ordering::Relaxed) {
             if next_time <= time::Instant::now() {
                 next_time = time::Instant::now() + time::Duration::from_secs(1);
-
-                match socket.send_to(request_traking.as_bytes(), format!("{:}:21412", ip)) {
-                    Ok(_) => {
-                        // nice
-                    }
-                    Err(error) => {
-                        warn!("Unable to request tracking data: {}", error) // Maybe reconnect
-                    }
+                if let Err(e) = socket.send_to(request_traking.as_bytes(), format!("{:}:21412", ip)) {
+                    warn!("Unable to request tracking data: {}", e);
                 }
             }
 
             match socket.recv_from(&mut buf) {
-                Ok((amt, _src)) => match serde_json::from_slice::<TrackingResponce>(&buf[..amt]) {
-                    Ok(data) => sender.send(data).unwrap(),
-                    Err(error) => {
-                        warn!("Unnable to deserialize: {}", error)
+                Ok((amt, _src)) => {
+                    last_received = time::Instant::now();
+                    match serde_json::from_slice::<TrackingResponce>(&buf[..amt]) {
+                        Ok(data) => { let _ = sender.send(data); }
+                        Err(e)   => { warn!("Deserialize tracking: {}", e); }
                     }
-                },
-                Err(error) => {
-                    warn!("Unnable to receive: {}", error) // Maybe reconnect
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                       || e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Normal read timeout — check if phone has gone away
+                    if last_received.elapsed() > time::Duration::from_secs(5) {
+                        warn!("Phone disconnected (no data for 5 s)");
+                        active.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("Receive error: {}", e);
                 }
             }
         }

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="rusty-bridger"
+APP_NAME="rbridger"
 VERSION=$(grep '^version' "$(dirname "$0")/../../ui/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ARCH="amd64"
-BINARY="rusty-bridge-ui"
+BINARY="rbridger-ui"
 WORKSPACE_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 RELEASE_BIN="$WORKSPACE_ROOT/target/release/$BINARY"
 OUT_DIR="$WORKSPACE_ROOT/dist/out"
@@ -15,7 +15,7 @@ ICON_SRC="$WORKSPACE_ROOT/ui/resources/rb128.png"
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
   echo "Building release (v${VERSION})..."
   cd "$WORKSPACE_ROOT"
-  cargo build --release -p rusty-bridge-ui
+  cargo build --release -p rbridger-ui
 fi
 
 rm -rf "$PKG_DIR"
@@ -36,7 +36,7 @@ Architecture: $ARCH
 Depends: libc6 (>= 2.31), libgtk-3-0
 Maintainer: LakoMoor <lakomoor@gmail.com>
 Homepage: https://github.com/LakoMoor/rusty-bridger
-Description: Rusty Bridger - VTube Studio face tracking bridge
+Description: RBridger - VTube Studio face tracking bridge
  Cross-platform bridge between face tracking sources and VTube Studio.
  Supports iPhone (via VTube Studio iOS app) and webcam (ONNX neural tracking).
  Free and open-source alternative to VBridger. Fork of rusty-bridge by ovROG.
@@ -44,7 +44,7 @@ CTRL
 
 cat > "$PKG_DIR/usr/share/applications/$APP_NAME.desktop" <<DESKTOP
 [Desktop Entry]
-Name=Rusty Bridger
+Name=RBridger
 GenericName=VTube Studio Bridge
 Comment=Face tracking bridge for VTube Studio
 Exec=/usr/bin/$APP_NAME

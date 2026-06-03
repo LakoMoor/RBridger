@@ -1,10 +1,13 @@
 [package]
-name = "rusty-bridge-ui"
-version = "0.2.0"
+name = "rbridger-ui"
+version = "0.2.2"
 edition = "2021"
 
+[features]
+webcam = ["rbridger-lib/webcam"]
+
 [dependencies]
-rusty-bridge-lib = { path = "../vts" }
+rbridger-lib = { path = "../vts" }
 eframe = "0.29"
 egui = "0.29"
 rfd = "0.15"
@@ -15,3 +18,4 @@ serde_json = "1.0.128"
 serde_yaml = "0.9.34"
 dirs = "5"
 evalexpr = "11.3"
+ureq = { version = "2", features = ["json"] }

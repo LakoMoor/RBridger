@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.2.0). Leave empty to skip publishing.'
+        description: 'Tag to release (e.g. v0.3.0). Leave empty to skip publishing.'
         required: false
         default: ''
 
@@ -20,12 +20,83 @@ permissions:
   contents: write
 
 jobs:
+  # ── Bump version & tag ────────────────────────────────────────────────────────
+  prepare:
+    name: Bump version
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag:     ${{ steps.ver.outputs.tag }}
+      sha:     ${{ steps.push.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG"              >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"      >> "$GITHUB_OUTPUT"
+
+      - name: Patch Cargo.toml files
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          sed -i "s/^version = \"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\"/version = \"$V\"/" \
+            Cargo.toml ui/Cargo.toml vts/Cargo.toml
+
+      - name: Patch Cargo.lock
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 - <<'EOF'
+          import re, os
+          v = os.environ['V']
+          content = open('Cargo.lock').read()
+          for pkg in ('rbridger', 'rbridger-ui', 'rbridger-lib'):
+              content = re.sub(
+                  rf'(name = "{pkg}"\nversion = ")[^"]*(")',
+                  rf'\g<1>{v}\g<2>',
+                  content
+              )
+          open('Cargo.lock', 'w').write(content)
+          EOF
+
+      - name: Commit, push & retag
+        id: push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml ui/Cargo.toml vts/Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore: bump version to ${{ steps.ver.outputs.version }} [skip ci]"
+            git push origin HEAD:master
+            SHA=$(git rev-parse HEAD)
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            TAG="${{ steps.ver.outputs.tag }}"
+            git tag -f "$TAG" "$SHA"
+            git push origin -f "refs/tags/$TAG"
+          fi
+
   # ── macOS DMG ──────────────────────────────────────────────────────────────
   build-macos:
     name: macOS DMG
+    needs: [prepare]
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha || github.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,7 +112,7 @@ jobs:
           restore-keys: macos-cargo-
 
       - name: Build release
-        run: cargo build --release -p rusty-bridge-ui
+        run: cargo build --release -p rbridger-ui --features webcam
 
       - name: Create .icns
         run: |
@@ -56,9 +127,9 @@ jobs:
 
       - name: Bundle .app
         run: |
-          APP=dist/out/RustyBridger.app
+          APP=dist/out/RBridger.app
           mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
-          cp target/release/rusty-bridge-ui $APP/Contents/MacOS/RustyBridger
+          cp target/release/rbridger-ui $APP/Contents/MacOS/RBridger
           [ -f ui/resources/rb.icns ] && cp ui/resources/rb.icns $APP/Contents/Resources/AppIcon.icns
           VERSION=$(grep '^version' ui/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           cat > $APP/Contents/Info.plist <<PLIST
@@ -66,10 +137,10 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>CFBundleIdentifier</key>         <string>com.lakomoor.rustybridger</string>
-            <key>CFBundleName</key>               <string>RustyBridger</string>
-            <key>CFBundleDisplayName</key>        <string>Rusty Bridger</string>
-            <key>CFBundleExecutable</key>         <string>RustyBridger</string>
+            <key>CFBundleIdentifier</key>         <string>com.lakomoor.rbridger</string>
+            <key>CFBundleName</key>               <string>RBridger</string>
+            <key>CFBundleDisplayName</key>        <string>RBridger</string>
+            <key>CFBundleExecutable</key>         <string>RBridger</string>
             <key>CFBundleIconFile</key>           <string>AppIcon</string>
             <key>CFBundleVersion</key>            <string>$VERSION</string>
             <key>CFBundleShortVersionString</key> <string>$VERSION</string>
@@ -85,26 +156,30 @@ jobs:
         run: |
           VERSION=$(grep '^version' ui/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           mkdir -p dist/out/.staging
-          cp -R dist/out/RustyBridger.app dist/out/.staging/
+          cp -R dist/out/RBridger.app dist/out/.staging/
           ln -s /Applications dist/out/.staging/Applications
-          hdiutil create -volname "RustyBridger" \
+          hdiutil create -volname "RBridger" \
             -srcfolder dist/out/.staging \
             -ov -format UDZO \
-            "dist/out/RustyBridger-${VERSION}-macos.dmg"
+            "dist/out/RBridger-${VERSION}-macos.dmg"
           rm -rf dist/out/.staging
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
-          path: dist/out/RustyBridger-*-macos.dmg
+          path: dist/out/RBridger-*-macos.dmg
 
   # ── Linux DEB ──────────────────────────────────────────────────────────────
   build-linux:
     name: Linux DEB
+    needs: [prepare]
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha || github.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -129,10 +204,12 @@ jobs:
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
             libssl-dev \
-            dpkg-dev
+            dpkg-dev \
+            libv4l-dev \
+            libudev-dev
 
       - name: Build release
-        run: cargo build --release -p rusty-bridge-ui
+        run: cargo build --release -p rbridger-ui --features webcam
 
       - name: Create DEB package
         run: SKIP_BUILD=1 bash dist/linux/build_deb.sh
@@ -146,9 +223,13 @@ jobs:
   # ── Windows EXE ────────────────────────────────────────────────────────────
   build-windows:
     name: Windows Installer
+    needs: [prepare]
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha || github.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -166,7 +247,7 @@ jobs:
           restore-keys: windows-cargo-
 
       - name: Build release
-        run: cargo build --release -p rusty-bridge-ui
+        run: cargo build --release -p rbridger-ui --features webcam
 
       - name: Install NSIS
         shell: pwsh
@@ -185,27 +266,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: dist/out/RustyBridger-*-windows-setup.exe
+          path: dist/out/RBridger-*-windows-setup.exe
 
   # ── GitHub Release ─────────────────────────────────────────────────────────
   release:
     name: Publish Release
-    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
-    needs: [build-macos, build-linux, build-windows]
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.build-macos.result == 'success' &&
+      needs.build-linux.result == 'success' &&
+      needs.build-windows.result == 'success'
+    needs: [prepare, build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Determine tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -215,7 +292,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
           files: |
             dist/out/**/*.dmg

@@ -133,6 +133,23 @@ pub struct CalcFn {
     pub default_value: f64,
 }
 
+/// Convert ARKit blend shape key to PascalCase + expand _L/_R to Left/Right.
+/// Examples: "eyeBlink_L" → "EyeBlinkLeft", "browOuterUp_R" → "BrowOuterUpRight", "jawOpen" → "JawOpen"
+fn arkit_to_pascal(k: &str) -> String {
+    let (base, side) = if k.ends_with("_L") {
+        (&k[..k.len() - 2], "Left")
+    } else if k.ends_with("_R") {
+        (&k[..k.len() - 2], "Right")
+    } else {
+        (k, "")
+    };
+    let mut chars = base.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str() + side,
+        None => String::new(),
+    }
+}
+
 pub struct VtsPc;
 
 impl VtsPc {
@@ -140,77 +157,65 @@ impl VtsPc {
         receiver: Receiver<TrackingResponce>,
         transformation_cfg_path: String,
         active: Arc<AtomicBool>,
+        vts_port: u16,
+        vts_connected: Arc<AtomicBool>,
     ) {
         while active.load(Ordering::Relaxed) {
-            let flag = Arc::clone(&active);
-
-            let websocket = VtsPc::connect();
-            VtsPc::msg_loop(websocket, &receiver, &transformation_cfg_path, flag);
+            let flag  = Arc::clone(&active);
+            let conn  = Arc::clone(&vts_connected);
+            let Some(websocket) = VtsPc::connect(vts_port, &active) else { break; };
+            VtsPc::msg_loop(websocket, &receiver, &transformation_cfg_path, flag, conn);
         }
     }
 
-    fn connect() -> WebSocket<MaybeTlsStream<TcpStream>> {
-        let mut port = "8001".to_string();
+    fn connect(port: u16, active: &Arc<AtomicBool>) -> Option<WebSocket<MaybeTlsStream<TcpStream>>> {
+        let mut try_port = port;
         loop {
-            match tungstenite::connect(format!("ws://localhost:{}", port)) {
-                Ok((websocket, _responce)) => {
-                    info!("Connected to local port:{}", port);
-                    return websocket;
+            if !active.load(Ordering::Relaxed) { return None; }
+            match tungstenite::connect(format!("ws://localhost:{}", try_port)) {
+                Ok((websocket, _)) => {
+                    info!("Connected to VTS on port {}", try_port);
+                    return Some(websocket);
                 }
                 Err(error) => {
-                    warn!("{}", error);
+                    warn!("VTS connect error: {}", error);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                     match VtsPc::discover_port() {
-                        Ok(prt) => {
-                            port = prt;
-                        }
-                        Err(e) => {
-                            warn!("{}", e);
-                            continue;
-                        }
+                        Ok(prt) => { try_port = prt; }
+                        Err(e) => { warn!("VTS discovery: {}", e); }
                     }
                 }
             }
         }
     }
 
-    fn discover_port() -> Result<String, String> {
+    fn discover_port() -> Result<u16, String> {
         let mut buf = [0; 4096];
-
-        let discovery_socket = match UdpSocket::bind("0.0.0.0:47779") {
-            Ok(s) => s,
-            Err(e) => return Err(e.to_string()),
-        };
-
-        match discovery_socket.set_read_timeout(Some(core::time::Duration::from_secs(3))) {
-            Ok(m) => m,
-            Err(e) => return Err(e.to_string()),
-        };
-
-        let (amt, _src) = match discovery_socket.recv_from(&mut buf) {
-            Ok(m) => m,
-            Err(e) => return Err(e.to_string()),
-        };
-
-        let data: VTSApiResponce<responces::Discovery> = match serde_json::from_slice(&buf[..amt]) {
-            Ok(d) => d,
-            Err(e) => return Err(e.to_string()),
-        };
-
-        Ok(data.data.port.to_string())
+        let sock = UdpSocket::bind("0.0.0.0:47779").map_err(|e| e.to_string())?;
+        sock.set_read_timeout(Some(core::time::Duration::from_secs(3))).map_err(|e| e.to_string())?;
+        let (amt, _) = sock.recv_from(&mut buf).map_err(|e| e.to_string())?;
+        let data: VTSApiResponce<responces::Discovery> =
+            serde_json::from_slice(&buf[..amt]).map_err(|e| e.to_string())?;
+        Ok(data.data.port)
     }
 
     fn msg_loop(
         mut websocket: WebSocket<MaybeTlsStream<TcpStream>>,
         receiver: &Receiver<TrackingResponce>,
-        transformation_cfg_path: &String,
+        transformation_cfg_path: &str,
         active: Arc<AtomicBool>,
+        vts_connected: Arc<AtomicBool>,
     ) {
+        vts_connected.store(false, Ordering::Relaxed);
         let mut msg_buffer: VecDeque<Message> = VecDeque::new();
         let mut token: Option<String> = fs::read_to_string("token").ok();
 
         msg_buffer.push_back(VtsPc::req_status_msg());
 
-        let (precalc_funcs, mut new_params) = VtsPc::precalc_cfg(transformation_cfg_path);
+        let Some((precalc_funcs, mut new_params)) = VtsPc::precalc_cfg(transformation_cfg_path) else {
+            error!("Failed to load transform config — aborting session");
+            return;
+        };
 
         msg_buffer.append(&mut new_params);
 
@@ -258,30 +263,28 @@ impl VtsPc {
                                         VTSApiResponce<responces::APIError>,
                                     >(msg_value)
                                     .unwrap();
-                                    // warn!("API error: {:?}", err_data.data);
+                                    warn!("VTS API error {}: {}", err_data.data.error_id, err_data.data.message);
                                     match err_data.data.error_id {
-                                        8 => {
-                                            // msg_buffer.push_back(VtsPc::auth(&token));
+                                        8 | 51 => {
+                                            // Not authenticated — clear queue and re-auth
+                                            msg_buffer.retain(|m| {
+                                                m.to_text().map(|s|
+                                                    s.contains("AuthenticationRequest") ||
+                                                    s.contains("AuthenticationTokenRequest")
+                                                ).unwrap_or(false)
+                                            });
+                                            if msg_buffer.is_empty() {
+                                                msg_buffer.push_front(VtsPc::auth(&token));
+                                            }
                                         }
-                                        51 => {
-                                            // POPUP ON SCREEN
-
-                                            // MAYBE
-                                            // DELAY
-                                            // msg_buffer.push_back(VtsPc::auth(&token));
-                                        }
-                                        352 => {
-                                            // custom parameter exist
-                                            msg_buffer.pop_front();
-                                        }
-                                        354 => {
-                                            // custom parameter is default
+                                        352 | 354 => {
+                                            // custom parameter already exists / is default — skip
                                             msg_buffer.pop_front();
                                         }
                                         450 => {
-                                            //No param data was sended
+                                            // no param data sent — ignore
                                         }
-                                        _ => error!("Unknown API error: {:?}", err_data.data),
+                                        _ => error!("Unknown VTS API error: {:?}", err_data.data),
                                     }
                                 }
                                 "APIStateResponse" => {
@@ -316,11 +319,14 @@ impl VtsPc {
                                     >(msg_value)
                                     .unwrap();
                                     msg_buffer.pop_front();
-                                    if !auth_data.data.authenticated {
+                                    if auth_data.data.authenticated {
+                                        vts_connected.store(true, Ordering::Relaxed);
+                                        info!("Authenticated with VTube Studio");
+                                    } else {
                                         token = None;
                                         let _ = fs::remove_file("token")
                                             .map_err(|e| error!("Unable to delete token: {:?}", e));
-                                        info!("Invalid Token, Requesting new...");
+                                        info!("Invalid token, requesting new...");
                                         msg_buffer.push_back(VtsPc::auth(&token));
                                     }
                                 }
@@ -372,8 +378,22 @@ impl VtsPc {
             }
         };
 
+        // One-time diagnostic: log what blend shapes the phone actually sends
+        static DIAG_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if raw_data.face_found && !DIAG_DONE.swap(true, Ordering::Relaxed) {
+            let keys: Vec<&str> = raw_data.blend_shapes.iter().map(|v| v.k.as_str()).collect();
+            info!("Phone blend shapes ({} total): {:?}", keys.len(), keys);
+        }
+
         for v in &raw_data.blend_shapes {
-            context.set_value(v.k.clone(), v.v.into()).unwrap();
+            // Normalize to PascalCase + expand _L/_R suffix to Left/Right
+            // e.g. eyeBlink_L → EyeBlinkLeft, browOuterUp_R → BrowOuterUpRight, jawOpen → JawOpen
+            let normalized = arkit_to_pascal(&v.k);
+            let _ = context.set_value(normalized.clone(), v.v.into());
+            // Keep original too so EyeBlinkLeft (already correct) and raw names also work
+            if normalized != v.k {
+                let _ = context.set_value(v.k.clone(), v.v.into());
+            }
         }
 
         context
@@ -400,15 +420,16 @@ impl VtsPc {
 
         if raw_data.face_found {
             for c in precalc_funcs {
+                let value = match c.1.eval_with_context(&context) {
+                    Ok(v) => v.as_float()
+                        .or_else(|_| v.as_int().map(|i| i as f64))
+                        .unwrap_or(0.0),
+                    Err(evalexpr::EvalexprError::VariableIdentifierNotFound(_)) => 0.0,
+                    Err(e) => { warn!("Formula '{}' eval error: {}", c.0, e); 0.0 }
+                };
                 params.push(requests::TrackingParam {
                     id: c.0.as_str(),
-                    value: c
-                        .1
-                        .eval_with_context(&context)
-                        .unwrap()
-                        .as_float()
-                        .unwrap()
-                        .clamp(-1000000.0, 1000000.0),
+                    value: value.clamp(-1000000.0, 1000000.0),
                     weight: Some(1.0),
                 });
             }
@@ -497,8 +518,8 @@ impl VtsPc {
         Message::text(token_req_msg)
     }
 
-    fn precalc_cfg(file_path: &String) -> (Vec<(String, evalexpr::Node)>, VecDeque<Message>) {
-        info!("Loadling tranformation config: {}", file_path);
+    fn precalc_cfg(file_path: &str) -> Option<(Vec<(String, evalexpr::Node)>, VecDeque<Message>)> {
+        info!("Loading transformation config: {}", file_path);
 
         let def_params = [
             String::from("FacePositionX"),
@@ -526,50 +547,43 @@ impl VtsPc {
         ];
 
         let mut new_params: VecDeque<Message> = VecDeque::new();
-        let config = fs::read_to_string(file_path).unwrap();
-        let calc_fns: Vec<CalcFn> = serde_json::from_str(&config[..]).unwrap();
+        let config = match fs::read_to_string(file_path) {
+            Ok(s) => s,
+            Err(e) => { error!("Cannot read transform config '{}': {}", file_path, e); return None; }
+        };
+        let calc_fns: Vec<CalcFn> = match serde_json::from_str(&config) {
+            Ok(v) => v,
+            Err(e) => { error!("Cannot parse transform config: {}", e); return None; }
+        };
 
-        let precalc_fns: Vec<_> = calc_fns
-            .into_iter()
-            .map(|func| {
-                (func.name.clone(), {
-                    info!("Loading Param: {}", &func.name);
-                    if !def_params.contains(&func.name) {
-                        let param_data = requests::ParameterCreation {
-                            parameter_name: func.name,
-                            explanation: "Custom rusty-bridge param".to_string(),
-                            min: func.min,
-                            max: func.max,
-                            default_value: func.default_value,
-                        };
+        let mut precalc_fns = Vec::new();
+        for func in calc_fns {
+            info!("Loading param: {}", &func.name);
+            let tree = match evalexpr::build_operator_tree(&func.func) {
+                Ok(t) => t,
+                Err(e) => { error!("Invalid formula for '{}': {}", func.name, e); return None; }
+            };
+            if !def_params.contains(&func.name) {
+                let param_data = requests::ParameterCreation {
+                    parameter_name: func.name.clone(),
+                    explanation: "Custom rusty-bridge param".to_string(),
+                    min: func.min,
+                    max: func.max,
+                    default_value: func.default_value,
+                };
+                let param_req = VTSApiRequest {
+                    data: Some(param_data),
+                    api_name: "VTubeStudioPublicAPI",
+                    api_version: "1.0",
+                    request_id: "iiii",
+                    message_type: "ParameterCreationRequest",
+                };
+                new_params.push_back(Message::text(serde_json::to_string(&param_req).unwrap()));
+            }
+            precalc_fns.push((func.name, tree));
+        }
 
-                        let param_req = VTSApiRequest {
-                            data: Some(param_data),
-                            api_name: "VTubeStudioPublicAPI",
-                            api_version: "1.0",
-                            request_id: "iiii",
-                            message_type: "ParameterCreationRequest",
-                        };
-
-                        let param_req_msg = serde_json::to_string(&param_req).unwrap();
-
-                        new_params.push_back(Message::text(param_req_msg));
-                    }
-                    match evalexpr::build_operator_tree(&func.func[..]) {
-                        Ok(calc) => calc,
-                        Err(error) => {
-                            error!(
-                                "Unable to read cfg (probably error or typo in function): {}",
-                                error
-                            );
-                            panic!()
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        info!("Tranformation config loaded");
-        (precalc_fns, new_params)
+        info!("Transformation config loaded ({} params)", precalc_fns.len());
+        Some((precalc_fns, new_params))
     }
 }

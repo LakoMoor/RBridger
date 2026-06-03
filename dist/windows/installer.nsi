@@ -1,17 +1,17 @@
-; NSIS installer for Rusty Bridger
+; NSIS installer for RBridger
 ; Build with: makensis installer.nsi
-; (Run from dist/windows/ after cargo build --release -p rusty-bridge-ui)
+; (Run from dist/windows/ after cargo build --release -p rbridger-ui)
 
-!define APP_NAME    "Rusty Bridger"
-!define APP_EXE     "rusty-bridge-ui.exe"
-!define APP_ID      "RustyBridger"
+!define APP_NAME    "RBridger"
+!define APP_EXE     "rbridger-ui.exe"
+!define APP_ID      "RBridger"
 !define VERSION     "0.2.0"
 !define PUBLISHER   "LakoMoor"
 !define URL         "https://github.com/LakoMoor/rusty-bridger"
 !define INSTALL_DIR "$PROGRAMFILES64\${APP_NAME}"
 
 Name "${APP_NAME} ${VERSION}"
-OutFile "..\..\dist\out\RustyBridger-${VERSION}-windows-setup.exe"
+OutFile "..\..\dist\out\RBridger-${VERSION}-windows-setup.exe"
 InstallDir "${INSTALL_DIR}"
 InstallDirRegKey HKLM "Software\${APP_ID}" "InstallDir"
 RequestExecutionLevel admin
@@ -22,7 +22,7 @@ SetCompressor /SOLID lzma
 !define MUI_ICON "..\..\ui\resources\rb.ico"
 !define MUI_UNICON "..\..\ui\resources\rb.ico"
 !define MUI_WELCOMEPAGE_TITLE "Welcome to ${APP_NAME} ${VERSION} Setup"
-!define MUI_WELCOMEPAGE_TEXT "This will install ${APP_NAME} on your computer.$\r$\n$\r$\nRusty Bridger bridges face tracking sources (iPhone or webcam) to VTube Studio.$\r$\n$\r$\nClick Next to continue."
+!define MUI_WELCOMEPAGE_TEXT "This will install ${APP_NAME} on your computer.$\r$\n$\r$\nRBridger bridges face tracking sources (iPhone or webcam) to VTube Studio.$\r$\n$\r$\nClick Next to continue."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch ${APP_NAME}"
 !define MUI_FINISHPAGE_LINK "Visit project page"
