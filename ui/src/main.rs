@@ -14,7 +14,7 @@ use std::{
 use eframe::egui;
 use rbridger_lib::{
     expr_app::ExprAppTracker,
-    vtspc::{CalcFn, VtsPc},
+    vtspc::{AfkConfig, CalcFn, VtsPc},
     vtsphone::{TrackingResponce, VtsPhone},
 };
 
@@ -80,6 +80,10 @@ struct Config {
     expr_app_port:  Option<u16>,
     webcam_index:   Option<u32>,
     start_tab:      Option<String>,
+    mirror:         Option<bool>,
+    afk_mode:       Option<bool>,
+    window_w:       Option<f32>,
+    window_h:       Option<f32>,
 }
 
 impl Config {
@@ -107,6 +111,7 @@ struct AppSettings {
     reconnect_delay_secs:  u32,
     log_level:             String,
     theme:                 String,
+    afk_timeout_secs:      u32,
 }
 
 impl Default for AppSettings {
@@ -117,6 +122,7 @@ impl Default for AppSettings {
             reconnect_delay_secs: 3,
             log_level:            "info".into(),
             theme:                "dark".into(),
+            afk_timeout_secs:     3,
         }
     }
 }
@@ -290,6 +296,11 @@ struct App {
     vts_connected:   Arc<AtomicBool>,
     pending_path:    Option<Receiver<Option<String>>>,
     editor:          Editor,
+    // Mirror & AFK
+    mirror:          bool,
+    afk_mode:        bool,
+    // Window size persistence
+    last_window_size: Option<egui::Vec2>,
     // Update checker
     update_rx:       Option<Receiver<Option<UpdateInfo>>>,
     update_info:     Option<UpdateInfo>,
@@ -301,17 +312,15 @@ impl App {
         let cfg      = Config::load();
         let settings = AppSettings::load();
         apply_theme(&cc.egui_ctx, &settings.theme);
+        setup_fonts(&cc.egui_ctx);
         let settings_draft = settings.clone();
 
-        // Background update check
         let (update_tx, update_rx) = mpsc::channel();
         thread::spawn(move || { let _ = update_tx.send(check_for_update()); });
 
-        // macOS camera permission (no-op on other platforms)
         #[cfg(feature = "webcam")]
         init_camera_permissions();
 
-        // Background camera enumeration
         let (cam_tx, cam_rx) = mpsc::channel();
         thread::spawn(move || {
             #[cfg(feature = "webcam")]
@@ -327,6 +336,9 @@ impl App {
             let s = if s == TrackingSource::ExprApp { TrackingSource::IPhone } else { s };
             s
         };
+
+        let mirror   = cfg.mirror.unwrap_or(false);
+        let afk_mode = cfg.afk_mode.unwrap_or(false);
 
         Self {
             transform_path:  cfg.transform_path.clone().unwrap_or_default(),
@@ -357,6 +369,9 @@ impl App {
             settings_draft,
             settings,
             cfg,
+            mirror,
+            afk_mode,
+            last_window_size: None,
             update_rx:   Some(update_rx),
             update_info: None,
             update_open: false,
@@ -369,6 +384,8 @@ impl App {
         self.cfg.source         = Some(self.source);
         self.cfg.expr_app_port  = self.expr_app_port.parse().ok();
         self.cfg.webcam_index   = Some(self.webcam_index);
+        self.cfg.mirror         = Some(self.mirror);
+        self.cfg.afk_mode       = Some(self.afk_mode);
         self.cfg.save();
     }
 
@@ -379,6 +396,11 @@ impl App {
         let flag  = Arc::clone(&self.active);
         let flag2 = Arc::clone(&self.active);
         let path  = self.transform_path.clone();
+        let mirror   = self.mirror;
+        let afk = AfkConfig {
+            enabled:      self.afk_mode,
+            timeout_secs: self.settings.afk_timeout_secs,
+        };
 
         match self.source {
             TrackingSource::IPhone => {
@@ -406,7 +428,7 @@ impl App {
 
         let vts_port = self.settings.vts_port;
         let vts_conn = Arc::clone(&self.vts_connected);
-        thread::spawn(move || VtsPc::run(rx, path, flag, vts_port, vts_conn));
+        thread::spawn(move || VtsPc::run(rx, path, flag, vts_port, vts_conn, mirror, afk));
     }
 
     fn disconnect(&mut self) {
@@ -445,6 +467,17 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, &self.settings_draft.theme);
 
+        // Persist window size when it changes
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            let sz = rect.size();
+            if self.last_window_size.map_or(true, |prev| (prev - sz).length() > 1.0) {
+                self.last_window_size = Some(sz);
+                self.cfg.window_w = Some(sz.x);
+                self.cfg.window_h = Some(sz.y);
+                self.cfg.save();
+            }
+        }
+
         // Sync vts_connected when phone/webcam thread stops the active flag
         if !self.active.load(Ordering::Relaxed) {
             self.vts_connected.store(false, Ordering::Relaxed);
@@ -472,7 +505,7 @@ impl eframe::App for App {
             }
         }
 
-        // Webcam preview floating window — landmark mesh only (no camera image)
+        // Webcam preview floating window
         #[cfg(feature = "webcam")]
         if self.show_preview {
             let lmks       = self.webcam_lmks.clone();
@@ -628,7 +661,7 @@ impl eframe::App for App {
     }
 }
 
-// ── Theme ─────────────────────────────────────────────────────────────────────
+// ── Theme & fonts ─────────────────────────────────────────────────────────────
 
 fn apply_theme(ctx: &egui::Context, theme: &str) {
     match theme {
@@ -637,15 +670,29 @@ fn apply_theme(ctx: &egui::Context, theme: &str) {
     }
 }
 
+fn setup_fonts(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        // Slightly larger body text for readability
+        for (text_style, font_id) in style.text_styles.iter_mut() {
+            match text_style {
+                egui::TextStyle::Body | egui::TextStyle::Button => {
+                    font_id.size = 14.0;
+                }
+                egui::TextStyle::Heading => {
+                    font_id.size = 16.0;
+                }
+                egui::TextStyle::Small => {
+                    font_id.size = 12.0;
+                }
+                _ => {}
+            }
+        }
+        style.spacing.item_spacing   = egui::vec2(8.0, 4.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    });
+}
+
 // ── Face landmark mesh ────────────────────────────────────────────────────────
-// InsightFace 2D-106 confirmed layout (official markup image):
-//  0-32   face contour (non-sequential, see OVAL below)
-//  33-42  left brow (subject right, left in image)
-//  43-51  left eye  (subject right)
-//  52-71  mouth     (outer 52-63, inner 64-71)
-//  72-86  nose
-//  87-96  right brow (subject left, right in image)
-//  97-105 right eye  (subject left)
 #[cfg(feature = "webcam")]
 fn draw_face_mesh(painter: &egui::Painter, pts: &[[f32; 2]], rect: egui::Rect, fw: f32, fh: f32) {
     let n = pts.len();
@@ -656,7 +703,6 @@ fn draw_face_mesh(painter: &egui::Painter, pts: &[[f32; 2]], rect: egui::Rect, f
         rect.min.y + (pts[i][1] / fh) * rect.height(),
     );
 
-    // Nearest-neighbor mesh background
     let s0  = egui::Stroke::new(0.6, egui::Color32::from_rgba_unmultiplied(150, 130, 110, 110));
     let md2 = (fw * 0.18) * (fw * 0.18);
     for i in 0..n {
@@ -678,7 +724,6 @@ fn draw_face_mesh(painter: &egui::Painter, pts: &[[f32; 2]], rect: egui::Rect, f
     let sm = egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(245, 245, 245, 215));
     let sc = egui::Stroke::new(0.9, egui::Color32::from_rgba_unmultiplied(180, 165, 145, 160));
 
-    // Face contour — correct clockwise connection order derived from official diagram
     const OVAL: &[usize] = &[
         17, 25, 26, 27, 28, 29, 30, 31, 32,
         18, 19, 20, 21, 22, 23, 24,
@@ -688,27 +733,21 @@ fn draw_face_mesh(painter: &egui::Painter, pts: &[[f32; 2]], rect: egui::Rect, f
     ];
     for w in OVAL.windows(2) { edge(w[0], w[1], sc); }
 
-    // Left brow 33-42, left eye 43-51 (subject's right, red in image)
     for k in 33..42 { edge(k, k + 1, sr); }
     for k in 43..51 { edge(k, k + 1, sr); }
     edge(51, 43, sr);
 
-    // Right brow 87-96, right eye 97-105 (subject's left, green in image)
     for k in 87..96 { edge(k, k + 1, sl); }
     for k in 97..105 { edge(k, k + 1, sl); }
     edge(105, 97, sl);
 
-    // Outer mouth 52-63 (loop)
     for k in 52..63 { edge(k, k + 1, sm); }
     edge(63, 52, sm);
-    // Inner mouth 64-71 (loop)
     for k in 64..71 { edge(k, k + 1, sm); }
     edge(71, 64, sm);
 
-    // Nose 72-86
     for k in 72..86 { edge(k, k + 1, sc); }
 
-    // Dots
     let cd = egui::Color32::from_rgba_unmultiplied(200, 100, 55, 195);
     for i in 0..n { painter.circle_filled(p(i), 1.5, cd); }
 }
@@ -754,16 +793,18 @@ fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool) {
     ui.separator();
     ui.add_space(8.0);
 
-    // ── Transform config (always shown) ────────────────────────────────────
+    // ── Transform config ───────────────────────────────────────────────────
     ui.horizontal(|ui| {
+        let btn_w = 36.0;
+        let field_w = (ui.available_width() - btn_w - 6.0).max(80.0);
         let r = ui.add_sized(
-            [ui.available_width() - 42.0, 22.0],
+            [field_w, 22.0],
             egui::TextEdit::singleline(&mut app.transform_path)
                 .hint_text("Transform config (.json)")
                 .interactive(!connected),
         );
         if r.changed() { app.save_config(); }
-        if ui.add_enabled(!connected, egui::Button::new("📂").min_size([36.0, 22.0].into()))
+        if ui.add_enabled(!connected, egui::Button::new("📂").min_size([btn_w, 22.0].into()))
             .on_hover_text("Browse…").clicked() {
             app.open_file_dialog();
         }
@@ -816,7 +857,6 @@ fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool) {
         }
 
         TrackingSource::Webcam => {
-            // Experimental warning banner
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(60, 40, 10))
                 .inner_margin(egui::Margin::symmetric(8.0, 5.0))
@@ -833,7 +873,6 @@ fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool) {
 
             ui.add_space(6.0);
 
-            // Camera selector
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Camera").small().color(egui::Color32::from_gray(160)));
 
@@ -945,7 +984,32 @@ fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool) {
         }
     }
 
-    ui.add_space(8.0);
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    // ── Mirror & AFK options ───────────────────────────────────────────────
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut app.mirror, "Mirror L/R").changed() {
+            app.save_config();
+        }
+        ui.label(egui::RichText::new("Flip head yaw, eyes, and body horizontal")
+            .small().color(egui::Color32::from_gray(120)));
+    });
+
+    ui.add_space(3.0);
+
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut app.afk_mode, "AFK detection").changed() {
+            app.save_config();
+        }
+        let timeout = app.settings.afk_timeout_secs;
+        ui.label(egui::RichText::new(
+            format!("Tell VTS face lost after {timeout} s away (Settings → AFK timeout)")
+        ).small().color(egui::Color32::from_gray(120)));
+    });
+
+    ui.add_space(6.0);
     ui.separator();
     ui.add_space(6.0);
     ui.label(egui::RichText::new("github.com/LakoMoor/RBridger")
@@ -1017,17 +1081,21 @@ fn config_editor_ui(
 
     // ── Main area: param list + editor ─────────────────────────────────────────
     let avail_h = ui.available_height();
+    let avail_w = ui.available_width();
+
+    // Left panel width: 38% of available, clamped to [130, 220]
+    let left_w = (avail_w * 0.38).clamp(130.0, 220.0);
 
     ui.horizontal(|ui| {
         // Left: scrollable param list
         ui.vertical(|ui| {
-            ui.set_width(190.0);
+            ui.set_width(left_w);
             egui::ScrollArea::vertical()
                 .id_salt("param_list")
                 .max_height(avail_h)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.set_min_width(180.0);
+                    ui.set_min_width(left_w - 8.0);
                     for i in 0..ed.params.len() {
                         let sel = ed.selected == Some(i);
                         let col = if sel { Color32::WHITE } else { Color32::from_gray(210) };
@@ -1052,6 +1120,7 @@ fn config_editor_ui(
         // Right: edit form + variables reference
         egui::ScrollArea::vertical()
             .id_salt("editor_right")
+            .max_height(avail_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if ed.selected.is_none() {
@@ -1062,10 +1131,9 @@ fn config_editor_ui(
                 } else {
                     let w = ui.available_width();
 
-                    // Name
                     ui.label(RichText::new("Name").small().color(Color32::from_gray(150)));
                     ui.horizontal(|ui| {
-                        let r = ui.add_sized([w - 60.0, 22.0], egui::TextEdit::singleline(&mut ed.buf_name));
+                        let r = ui.add_sized([(w - 60.0).max(60.0), 22.0], egui::TextEdit::singleline(&mut ed.buf_name));
                         if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
                         if ed.name_dup {
                             ui.label(RichText::new("⚠ dup").small().color(Color32::from_rgb(240, 160, 30)));
@@ -1074,7 +1142,6 @@ fn config_editor_ui(
 
                     ui.add_space(5.0);
 
-                    // Formula
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Formula").small().color(Color32::from_gray(150)));
                         match ed.formula_ok {
@@ -1093,9 +1160,8 @@ fn config_editor_ui(
 
                     ui.add_space(5.0);
 
-                    // Range
                     ui.label(RichText::new("Range").small().color(Color32::from_gray(150)));
-                    let fw = (w - 86.0) / 3.0;
+                    let fw = ((w - 86.0) / 3.0).max(30.0);
                     ui.horizontal(|ui| {
                         let mut changed = false;
                         ui.label(RichText::new("min").small().color(Color32::from_gray(160)));
@@ -1107,7 +1173,6 @@ fn config_editor_ui(
                         if changed { ed.apply_edit(); ed.validate_buffers(); }
                     });
 
-                    // Range bar
                     let min_v: f64 = ed.buf_min.parse().unwrap_or(-1.0);
                     let max_v: f64 = ed.buf_max.parse().unwrap_or(1.0);
                     let def_v: f64 = ed.buf_default.parse().unwrap_or(0.0);
@@ -1117,7 +1182,7 @@ fn config_editor_ui(
                     ui.add_space(3.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{:.1}", min_v)).small().monospace().color(Color32::from_gray(150)));
-                        let bw = ui.available_width() - 30.0;
+                        let bw = (ui.available_width() - 30.0).max(10.0);
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(bw, 7.0), egui::Sense::hover());
                         ui.painter().rect_filled(rect, 3.0, Color32::from_gray(45));
                         let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * t, rect.height()));
@@ -1131,7 +1196,7 @@ fn config_editor_ui(
                     });
                 }
 
-                // ── Variables reference (always visible) ─────────────────────
+                // ── Variables reference ──────────────────────────────────────
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -1183,6 +1248,21 @@ fn settings_ui(
                 egui::Slider::new(&mut draft.reconnect_delay_secs, 1..=30).suffix("s"));
             ui.end_row();
         });
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("AFK detection").strong());
+        ui.separator();
+        egui::Grid::new("afk_grid").num_columns(2).spacing([12.0, 6.0]).min_col_width(120.0).show(ui, |ui| {
+            ui.label("AFK timeout");
+            ui.add(egui::Slider::new(&mut draft.afk_timeout_secs, 1..=30).suffix("s")
+                .clamp_to_range(true));
+            ui.end_row();
+        });
+        ui.add_space(3.0);
+        ui.label(egui::RichText::new(
+            "When AFK detection is enabled (Bridge tab), VTS is told the face is\n\
+             lost after this many seconds of no tracking data."
+        ).small().color(egui::Color32::from_gray(130)));
 
         ui.add_space(10.0);
         ui.label(egui::RichText::new("Appearance").strong());
@@ -1339,7 +1419,6 @@ fn about_ui(
         ui.separator();
         ui.add_space(8.0);
 
-        // ── Update check ───────────────────────────────────────────────────
         ui.vertical_centered(|ui| {
             let checking = update_rx.is_some();
             if checking {
@@ -1391,10 +1470,15 @@ fn main() {
         let _ = log4rs::init_raw_config(raw);
     }
 
+    // Restore saved window size
+    let init_cfg = Config::load();
+    let init_w = init_cfg.window_w.unwrap_or(460.0).max(380.0);
+    let init_h = init_cfg.window_h.unwrap_or(440.0).max(340.0);
+
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/rb128.png")).ok();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
-        .with_inner_size([440.0, 400.0])
+        .with_inner_size([init_w, init_h])
         .with_min_inner_size([380.0, 340.0])
         .with_resizable(true);
     if let Some(icon) = icon {

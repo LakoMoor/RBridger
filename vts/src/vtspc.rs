@@ -7,6 +7,7 @@ use std::{
         mpsc::Receiver,
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use evalexpr::{ContextWithMutableVariables, HashMapContext, Node};
@@ -111,7 +112,7 @@ pub mod requests {
     pub struct TrackingParam<'a> {
         pub id: &'a str,
         pub weight: Option<f64>,
-        pub value: f64, // -1000000 | 1000000
+        pub value: f64,
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -120,6 +121,12 @@ pub mod requests {
         pub face_found: bool,
         pub mode: &'a str,
         pub parameter_values: Vec<TrackingParam<'a>>,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HotkeyTrigger<'a> {
+        pub hotkey_id: &'a str,
     }
 }
 
@@ -133,8 +140,13 @@ pub struct CalcFn {
     pub default_value: f64,
 }
 
+/// AFK detection config: after `timeout_secs` of face_found=false, signal VTS.
+pub struct AfkConfig {
+    pub enabled: bool,
+    pub timeout_secs: u32,
+}
+
 /// Convert ARKit blend shape key to PascalCase + expand _L/_R to Left/Right.
-/// Examples: "eyeBlink_L" → "EyeBlinkLeft", "browOuterUp_R" → "BrowOuterUpRight", "jawOpen" → "JawOpen"
 fn arkit_to_pascal(k: &str) -> String {
     let (base, side) = if k.ends_with("_L") {
         (&k[..k.len() - 2], "Left")
@@ -150,6 +162,17 @@ fn arkit_to_pascal(k: &str) -> String {
     }
 }
 
+/// Swap "Left" ↔ "Right" suffix for horizontal mirror mode.
+fn mirror_lr(name: &str) -> String {
+    if name.ends_with("Left") {
+        name[..name.len() - 4].to_owned() + "Right"
+    } else if name.ends_with("Right") {
+        name[..name.len() - 5].to_owned() + "Left"
+    } else {
+        name.to_owned()
+    }
+}
+
 pub struct VtsPc;
 
 impl VtsPc {
@@ -159,12 +182,14 @@ impl VtsPc {
         active: Arc<AtomicBool>,
         vts_port: u16,
         vts_connected: Arc<AtomicBool>,
+        mirror: bool,
+        afk: AfkConfig,
     ) {
         while active.load(Ordering::Relaxed) {
             let flag  = Arc::clone(&active);
             let conn  = Arc::clone(&vts_connected);
             let Some(websocket) = VtsPc::connect(vts_port, &active) else { break; };
-            VtsPc::msg_loop(websocket, &receiver, &transformation_cfg_path, flag, conn);
+            VtsPc::msg_loop(websocket, &receiver, &transformation_cfg_path, flag, conn, mirror, &afk);
         }
     }
 
@@ -179,10 +204,10 @@ impl VtsPc {
                 }
                 Err(error) => {
                     warn!("VTS connect error: {}", error);
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    std::thread::sleep(Duration::from_millis(500));
                     match VtsPc::discover_port() {
                         Ok(prt) => { try_port = prt; }
-                        Err(e) => { warn!("VTS discovery: {}", e); }
+                        Err(e)  => { warn!("VTS discovery: {}", e); }
                     }
                 }
             }
@@ -192,7 +217,7 @@ impl VtsPc {
     fn discover_port() -> Result<u16, String> {
         let mut buf = [0; 4096];
         let sock = UdpSocket::bind("0.0.0.0:47779").map_err(|e| e.to_string())?;
-        sock.set_read_timeout(Some(core::time::Duration::from_secs(3))).map_err(|e| e.to_string())?;
+        sock.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
         let (amt, _) = sock.recv_from(&mut buf).map_err(|e| e.to_string())?;
         let data: VTSApiResponce<responces::Discovery> =
             serde_json::from_slice(&buf[..amt]).map_err(|e| e.to_string())?;
@@ -205,6 +230,8 @@ impl VtsPc {
         transformation_cfg_path: &str,
         active: Arc<AtomicBool>,
         vts_connected: Arc<AtomicBool>,
+        mirror: bool,
+        afk: &AfkConfig,
     ) {
         vts_connected.store(false, Ordering::Relaxed);
         let mut msg_buffer: VecDeque<Message> = VecDeque::new();
@@ -219,10 +246,9 @@ impl VtsPc {
 
         msg_buffer.append(&mut new_params);
 
-        // let interval = time::Duration::from_millis(30);
-        // let mut next_time = std::time::Instant::now() + interval;
-
         let mut dont_send = false;
+        let mut last_face_found = Instant::now();
+        let mut afk_active = false;
 
         while active.load(Ordering::Relaxed) {
             if !dont_send {
@@ -231,17 +257,29 @@ impl VtsPc {
                         Ok(_) => {}
                         Err(error) => {
                             warn!("Unable to send msg: {}", error);
-                            break; // Reconnect
+                            break;
                         }
                     }
                 } else {
-                    let tracking_data = VtsPc::tracking_msg(&precalc_funcs, receiver);
-                    if tracking_data.is_some() {
-                        match websocket.send(tracking_data.unwrap()) {
+                    let send_no_face = afk.enabled && afk_active;
+                    if let Some((msg, face_found)) =
+                        VtsPc::tracking_msg(&precalc_funcs, receiver, mirror, send_no_face)
+                    {
+                        let now = Instant::now();
+                        if face_found {
+                            last_face_found = now;
+                            afk_active = false;
+                        } else if afk.enabled && !afk_active
+                            && now.duration_since(last_face_found)
+                                >= Duration::from_secs(afk.timeout_secs.into())
+                        {
+                            afk_active = true;
+                        }
+                        match websocket.send(msg) {
                             Ok(_) => {}
                             Err(error) => {
                                 warn!("Unable to send tracking msg: {}", error);
-                                break; // Reconnect
+                                break;
                             }
                         }
                     } else {
@@ -266,7 +304,6 @@ impl VtsPc {
                                     warn!("VTS API error {}: {}", err_data.data.error_id, err_data.data.message);
                                     match err_data.data.error_id {
                                         8 | 51 => {
-                                            // Not authenticated — clear queue and re-auth
                                             msg_buffer.retain(|m| {
                                                 m.to_text().map(|s|
                                                     s.contains("AuthenticationRequest") ||
@@ -277,37 +314,28 @@ impl VtsPc {
                                                 msg_buffer.push_front(VtsPc::auth(&token));
                                             }
                                         }
-                                        352 | 354 => {
-                                            // custom parameter already exists / is default — skip
-                                            msg_buffer.pop_front();
-                                        }
-                                        450 => {
-                                            // no param data sent — ignore
-                                        }
+                                        352 | 354 => { msg_buffer.pop_front(); }
+                                        450 => {}
                                         _ => error!("Unknown VTS API error: {:?}", err_data.data),
                                     }
                                 }
                                 "APIStateResponse" => {
-                                    let state_data =
-                                        serde_json::from_value::<
-                                            VTSApiResponce<responces::APIStateResponse>,
-                                        >(msg_value)
-                                        .unwrap();
+                                    let state_data = serde_json::from_value::<
+                                        VTSApiResponce<responces::APIStateResponse>,
+                                    >(msg_value)
+                                    .unwrap();
                                     msg_buffer.pop_front();
                                     if !state_data.data.current_session_authenticated {
                                         msg_buffer.push_front(VtsPc::auth(&token));
                                     }
                                 }
                                 "AuthenticationTokenResponse" => {
-                                    let token_data =
-                                        serde_json::from_value::<
-                                            VTSApiResponce<responces::AuthenticationToken>,
-                                        >(msg_value)
-                                        .unwrap();
-
-                                    let _ =
-                                        fs::write("token", &token_data.data.authentication_token)
-                                            .map_err(|e| error!("Unable to save token: {:?}", e));
+                                    let token_data = serde_json::from_value::<
+                                        VTSApiResponce<responces::AuthenticationToken>,
+                                    >(msg_value)
+                                    .unwrap();
+                                    let _ = fs::write("token", &token_data.data.authentication_token)
+                                        .map_err(|e| error!("Unable to save token: {:?}", e));
                                     token = Some(token_data.data.authentication_token);
                                     info!("Recived Token from VtubeStudio");
                                     msg_buffer.pop_front();
@@ -330,13 +358,9 @@ impl VtsPc {
                                         msg_buffer.push_back(VtsPc::auth(&token));
                                     }
                                 }
-                                "InjectParameterDataResponse" => {
-                                    // println!("{:?}", msg);
-                                }
-                                "ParameterCreationResponse" => {
-                                    // println!("{:?}", msg);
-                                    msg_buffer.pop_front();
-                                }
+                                "InjectParameterDataResponse" => {}
+                                "ParameterCreationResponse" => { msg_buffer.pop_front(); }
+                                "HotkeyTriggerResponse" => {}
                                 _ => warn!("Unknown message: {}", msg_value["messageType"]),
                             },
                             None => warn!("No type in responce: {}", msg.to_text().unwrap()),
@@ -352,33 +376,22 @@ impl VtsPc {
                 }
                 Err(error) => {
                     warn!("Unable to read msg: {}", error);
-                    break; // Reconnect
+                    break;
                 }
             }
-
-            //rate limit
-            // thread::sleep(next_time - std::time::Instant::now());
-            // next_time += interval;
         }
     }
 
     fn tracking_msg(
-        precalc_funcs: &Vec<(String, Node)>,
+        precalc_funcs: &[(String, Node)],
         receiver: &Receiver<TrackingResponce>,
-    ) -> Option<Message> {
+        mirror: bool,
+        send_no_face: bool,
+    ) -> Option<(Message, bool)> {
         let mut context = HashMapContext::new();
 
-        let mut binding = receiver.try_iter();
-        let it = binding.by_ref();
+        let raw_data = receiver.try_iter().last()?;
 
-        let raw_data = match it.last() {
-            Some(data) => data,
-            None => {
-                return None;
-            }
-        };
-
-        // One-time diagnostic: log what blend shapes the phone actually sends
         static DIAG_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if raw_data.face_found && !DIAG_DONE.swap(true, Ordering::Relaxed) {
             let keys: Vec<&str> = raw_data.blend_shapes.iter().map(|v| v.k.as_str()).collect();
@@ -386,39 +399,33 @@ impl VtsPc {
         }
 
         for v in &raw_data.blend_shapes {
-            // Normalize to PascalCase + expand _L/_R suffix to Left/Right
-            // e.g. eyeBlink_L → EyeBlinkLeft, browOuterUp_R → BrowOuterUpRight, jawOpen → JawOpen
             let normalized = arkit_to_pascal(&v.k);
-            let _ = context.set_value(normalized.clone(), v.v.into());
-            // Keep original too so EyeBlinkLeft (already correct) and raw names also work
-            if normalized != v.k {
+            let key = if mirror { mirror_lr(&normalized) } else { normalized.clone() };
+            let _ = context.set_value(key.clone(), v.v.into());
+            if key != v.k {
                 let _ = context.set_value(v.k.clone(), v.v.into());
             }
         }
 
-        context
-            .set_value("HeadPosX".into(), raw_data.position.x.into())
-            .unwrap();
-        context
-            .set_value("HeadPosY".into(), raw_data.position.y.into())
-            .unwrap();
-        context
-            .set_value("HeadPosZ".into(), raw_data.position.z.into())
-            .unwrap();
+        let rot_y = if mirror { -raw_data.rotation.y } else { raw_data.rotation.y };
+        let pos_x = if mirror { -raw_data.position.x } else { raw_data.position.x };
 
-        context
-            .set_value("HeadRotX".into(), raw_data.rotation.x.into())
-            .unwrap();
-        context
-            .set_value("HeadRotY".into(), raw_data.rotation.y.into())
-            .unwrap();
-        context
-            .set_value("HeadRotZ".into(), raw_data.rotation.z.into())
-            .unwrap();
+        context.set_value("HeadPosX".into(), pos_x.into()).unwrap();
+        context.set_value("HeadPosY".into(), raw_data.position.y.into()).unwrap();
+        context.set_value("HeadPosZ".into(), raw_data.position.z.into()).unwrap();
+        context.set_value("HeadRotX".into(), raw_data.rotation.x.into()).unwrap();
+        context.set_value("HeadRotY".into(), rot_y.into()).unwrap();
+        context.set_value("HeadRotZ".into(), raw_data.rotation.z.into()).unwrap();
+
+        let face_found = raw_data.face_found;
+
+        if !face_found && !send_no_face {
+            return None;
+        }
 
         let mut params: Vec<requests::TrackingParam> = Vec::new();
 
-        if raw_data.face_found {
+        if face_found {
             for c in precalc_funcs {
                 let value = match c.1.eval_with_context(&context) {
                     Ok(v) => v.as_float()
@@ -435,29 +442,21 @@ impl VtsPc {
             }
         }
 
-        if params.is_empty() {
-            return None;
-        }
-
         let params_data = requests::InjectParams {
-            face_found: raw_data.face_found,
+            face_found,
             mode: "set",
             parameter_values: params,
         };
-
-        let message_type = "InjectParameterDataRequest";
 
         let request = VTSApiRequest {
             data: Some(params_data),
             api_name: "VTubeStudioPublicAPI",
             api_version: "1.0",
             request_id: "iiii",
-            message_type,
+            message_type: "InjectParameterDataRequest",
         };
 
-        let request_string = serde_json::to_string(&request).unwrap();
-
-        Some(Message::text(request_string))
+        Some((Message::text(serde_json::to_string(&request).unwrap()), face_found))
     }
 
     fn req_status_msg() -> Message {
@@ -468,22 +467,18 @@ impl VtsPc {
             request_id: "iiii",
             message_type: "APIStateRequest",
         };
-
-        let status_req_msg = serde_json::to_string(&status_req).unwrap();
         info!("Requesing status of VtubeStudio");
-        Message::text(status_req_msg)
+        Message::text(serde_json::to_string(&status_req).unwrap())
     }
 
     fn auth(token: &Option<String>) -> Message {
         if token.is_some() {
             let tk = token.clone().unwrap();
-
             let auth_token = requests::Auth {
                 plugin_name: "RustyBridgeUi",
                 plugin_developer: "ovROG",
                 authentication_token: tk.as_str(),
             };
-
             let auth_req = VTSApiRequest {
                 data: Some(auth_token),
                 api_name: "VTubeStudioPublicAPI",
@@ -491,11 +486,8 @@ impl VtsPc {
                 request_id: "iiii",
                 message_type: "AuthenticationRequest",
             };
-
-            let auth_req_msg = serde_json::to_string(&auth_req).unwrap();
-
             info!("Authentication Request to VtubeStudio");
-            return Message::text(auth_req_msg);
+            return Message::text(serde_json::to_string(&auth_req).unwrap());
         }
 
         let auth_data = requests::AuthToken {
@@ -503,7 +495,6 @@ impl VtsPc {
             plugin_developer: "ovROG",
             plugin_icon: None,
         };
-
         let token_req = VTSApiRequest {
             data: Some(auth_data),
             api_name: "VTubeStudioPublicAPI",
@@ -511,11 +502,8 @@ impl VtsPc {
             request_id: "iiii",
             message_type: "AuthenticationTokenRequest",
         };
-
-        let token_req_msg = serde_json::to_string(&token_req).unwrap();
-
         info!("Authentication Token Request: Please accept PopUp in VtubeStudio");
-        Message::text(token_req_msg)
+        Message::text(serde_json::to_string(&token_req).unwrap())
     }
 
     fn precalc_cfg(file_path: &str) -> Option<(Vec<(String, evalexpr::Node)>, VecDeque<Message>)> {
