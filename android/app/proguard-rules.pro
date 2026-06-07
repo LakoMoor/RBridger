@@ -1,0 +1,3 @@
+-keep class com.google.mediapipe.** { *; }
+-keep class com.google.flatbuffers.** { *; }
+-dontwarn com.google.mediapipe.**

@@ -12,29 +12,84 @@ use std::{
 
 use image::imageops;
 use log::{info, warn};
-use ndarray::Array4;
+use ndarray::{Array3, Array4};
 use ort::{session::Session, value::TensorRef};
 
 use crate::vtsphone::{Cords, Shape, TrackingResponce};
 
-const DET_URL: &str = "https://media.githubusercontent.com/media/onnx/models/main/validated/vision/body_analysis/ultraface/models/version-RFB-320.onnx";
-const LMK_URL: &str = "https://huggingface.co/kunkunlin1221/face-landmarks-2d-106_mbv1/resolve/main/coordinate_reg_mbv1_fp32.onnx";
-const DET_PATH: &str = "face_det.onnx";
-const LMK_PATH: &str = "face_lmk.onnx";
+// ── Model URLs & paths ────────────────────────────────────────────────────────
 
-/// A single camera frame with detected face data, shared with the UI for preview.
+const DET_URL: &str = "https://media.githubusercontent.com/media/onnx/models/main/validated/vision/body_analysis/ultraface/models/version-RFB-320.onnx";
+const DET_PATH: &str = "face_det.onnx";
+
+const LMK_URL: &str = "https://github.com/LakoMoor/RBridger/raw/master/models/face_landmarks_mediapipe.onnx";
+const LMK_PATH: &str = "face_lmk_mp.onnx";
+
+const BS_URL: &str = "https://github.com/LakoMoor/RBridger/raw/master/models/face_blendshapes_mediapipe.onnx";
+const BS_PATH: &str = "face_bs_mp.onnx";
+
+// ── MediaPipe constants ───────────────────────────────────────────────────────
+
+// 146 landmark indices selected from 478-point mesh as input for blendshape model.
+// Source: mediapipe/tasks/cc/vision/face_landmarker/face_blendshapes_graph.cc
+const BS_IDXS: [usize; 146] = [
+      0,  1,  4,  5,  6,  7,  8, 10, 13, 14, 17, 21, 33, 37, 39, 40, 46, 52,
+     53, 54, 55, 58, 61, 63, 65, 66, 67, 70, 78, 80, 81, 82, 84, 87, 88, 91,
+     93, 95,103,105,107,109,127,132,133,136,144,145,146,148,149,150,152,153,
+    154,155,157,158,159,160,161,162,163,168,172,173,176,178,181,185,191,195,
+    197,234,246,249,251,263,267,269,270,276,282,283,284,285,288,291,293,295,
+    296,297,300,308,310,311,312,314,317,318,321,323,324,332,334,336,338,356,
+    361,362,365,373,374,375,377,378,379,380,381,382,384,385,386,387,388,389,
+    390,397,398,400,402,405,409,415,454,466,468,469,470,471,472,473,474,475,
+    476,477,
+];
+
+// 52 blend shape names matching MediaPipe output order (index 0 = _neutral, skipped).
+// Names are PascalCase to match VTube Studio ARKit parameter names.
+const BS_NAMES: [&str; 52] = [
+    "_neutral",
+    "BrowDownLeft",  "BrowDownRight",  "BrowInnerUp",
+    "BrowOuterUpLeft",  "BrowOuterUpRight",
+    "CheekPuff",     "CheekSquintLeft",  "CheekSquintRight",
+    "EyeBlinkLeft",  "EyeBlinkRight",
+    "EyeLookDownLeft",  "EyeLookDownRight",
+    "EyeLookInLeft",    "EyeLookInRight",
+    "EyeLookOutLeft",   "EyeLookOutRight",
+    "EyeLookUpLeft",    "EyeLookUpRight",
+    "EyeSquintLeft",    "EyeSquintRight",
+    "EyeWideLeft",      "EyeWideRight",
+    "JawForward", "JawLeft", "JawOpen", "JawRight",
+    "MouthClose",
+    "MouthDimpleLeft",  "MouthDimpleRight",
+    "MouthFrownLeft",   "MouthFrownRight",
+    "MouthFunnel",  "MouthLeft",  "MouthRight",
+    "MouthLowerDownLeft",  "MouthLowerDownRight",
+    "MouthPressLeft",   "MouthPressRight",
+    "MouthPucker",
+    "MouthRollLower",  "MouthRollUpper",
+    "MouthShrugLower", "MouthShrugUpper",
+    "MouthSmileLeft",  "MouthSmileRight",
+    "MouthStretchLeft","MouthStretchRight",
+    "MouthUpperUpLeft","MouthUpperUpRight",
+    "NoseSneerLeft",   "NoseSneerRight",
+];
+
+// ── Preview frame ─────────────────────────────────────────────────────────────
+
 pub struct PreviewFrame {
     pub width:     u32,
     pub height:    u32,
-    pub rgb:       Vec<u8>,          // raw RGB pixels (width * height * 3)
-    pub landmarks: Vec<[f32; 2]>,    // pixel coords in preview image space
-    pub bbox:      Option<[f32; 4]>, // normalized [x1,y1,x2,y2] 0..1
+    pub rgb:       Vec<u8>,
+    pub landmarks: Vec<[f32; 2]>, // pixel coords in preview image space
+    pub bbox:      Option<[f32; 4]>,
 }
 
 pub fn init_camera_permissions() {
     #[cfg(target_os = "macos")]
     nokhwa::nokhwa_initialize(|_| {});
 }
+
+// ── WebcamTracker ─────────────────────────────────────────────────────────────
 
 pub struct WebcamTracker;
 
@@ -57,13 +112,9 @@ impl WebcamTracker {
             return Ok(());
         }
         info!("Downloading {}…", path);
-        let resp = ureq::get(url)
-            .call()
-            .map_err(|e| format!("HTTP: {e}"))?;
+        let resp = ureq::get(url).call().map_err(|e| format!("HTTP: {e}"))?;
         let mut buf = Vec::new();
-        resp.into_reader()
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("Read: {e}"))?;
+        resp.into_reader().read_to_end(&mut buf).map_err(|e| format!("Read: {e}"))?;
         std::fs::write(path, &buf).map_err(|e| format!("Write: {e}"))?;
         info!("Saved {} ({} KB)", path, buf.len() / 1024);
         Ok(())
@@ -75,13 +126,11 @@ impl WebcamTracker {
         active:  Arc<AtomicBool>,
         preview: Arc<Mutex<Option<PreviewFrame>>>,
     ) {
-        if let Err(e) = Self::download(DET_URL, DET_PATH) {
-            warn!("Det model: {}", e);
-            return;
-        }
-        if let Err(e) = Self::download(LMK_URL, LMK_PATH) {
-            warn!("Lmk model: {}", e);
-            return;
+        for (url, path) in [(DET_URL, DET_PATH), (LMK_URL, LMK_PATH), (BS_URL, BS_PATH)] {
+            if let Err(e) = Self::download(url, path) {
+                warn!("Model download {}: {}", path, e);
+                return;
+            }
         }
 
         let mut det = match Session::builder().and_then(|mut b| b.commit_from_file(DET_PATH)) {
@@ -92,8 +141,12 @@ impl WebcamTracker {
             Ok(s) => s,
             Err(e) => { warn!("Load lmk: {}", e); return; }
         };
+        let mut bs = match Session::builder().and_then(|mut b| b.commit_from_file(BS_PATH)) {
+            Ok(s) => s,
+            Err(e) => { warn!("Load blendshapes: {}", e); return; }
+        };
 
-        info!("Models loaded: det={} lmk={}", DET_PATH, LMK_PATH);
+        info!("MediaPipe models loaded: det + landmark(478pt) + blendshapes(52)");
 
         use nokhwa::{
             pixel_format::RgbFormat,
@@ -106,9 +159,7 @@ impl WebcamTracker {
             Ok(c) => c,
             Err(e) => { warn!("Camera {}: {}", camera_index, e); return; }
         };
-        if let Err(e) = cam.open_stream() {
-            warn!("Stream: {}", e); return;
-        }
+        if let Err(e) = cam.open_stream() { warn!("Stream: {}", e); return; }
 
         let mut ts: u64 = 0;
         while active.load(Ordering::Relaxed) {
@@ -122,17 +173,31 @@ impl WebcamTracker {
             };
             let (iw, ih) = img.dimensions();
 
-            // Run detection and collect data for both tracking and preview.
             let mut preview_lmks: Vec<[f32; 2]> = vec![];
             let mut preview_bbox: Option<[f32; 4]> = None;
 
             let tracking = match detect_face(&mut det, &img) {
                 Some((bbox, score)) if score > 0.65 => {
                     preview_bbox = Some(bbox);
-                    match detect_landmarks(&mut lmk, &img, bbox) {
-                        Some(lmks) => {
-                            preview_lmks = lmks.clone();
-                            blendshapes(lmks, bbox, iw, ih, ts)
+                    match detect_landmarks_mp(&mut lmk, &img, bbox) {
+                        Some((lmks_norm, cx, cy, cw, ch)) => {
+                            // Map normalized (in-crop) landmarks to image pixel coords for preview
+                            preview_lmks = lmks_norm[..468].iter().map(|p| {
+                                [p[0] * cw as f32 + cx as f32,
+                                 p[1] * ch as f32 + cy as f32]
+                            }).collect();
+
+                            let shapes = compute_blendshapes(&mut bs, &lmks_norm);
+                            let (pitch, yaw, roll, px, py, pz) =
+                                head_pose(&lmks_norm, cx, cy, cw, ch, iw, ih);
+
+                            TrackingResponce {
+                                timestamp: ts, hotkey: 0, face_found: true,
+                                rotation: Cords { x: pitch as f64, y: yaw as f64, z: roll as f64 },
+                                position: Cords { x: px as f64,    y: py as f64,  z: pz as f64 },
+                                eye_left: Cords { x: 0.0, y: 0.0, z: 0.0 },
+                                blend_shapes: shapes,
+                            }
                         }
                         None => no_face(ts),
                     }
@@ -142,7 +207,7 @@ impl WebcamTracker {
             ts += 1;
             let _ = sender.send(tracking);
 
-            // Write downscaled preview frame (non-blocking).
+            // Write downscaled preview (non-blocking)
             if let Ok(mut guard) = preview.try_lock() {
                 const MAX_W: u32 = 320;
                 let (pw, ph, prgb, plmks, pbbox) = if iw > MAX_W {
@@ -167,9 +232,8 @@ impl WebcamTracker {
     }
 }
 
-// ── UltraFace RFB-320 ────────────────────────────────────────────────────────
-// In:  [1,3,240,320] f32 normalised (p-127)/128
-// Out: [0] scores[1,4420,2]  [1] boxes[1,4420,4]
+// ── UltraFace RFB-320 ─────────────────────────────────────────────────────────
+// In:  [1,3,240,320] f32 (p-127)/128   Out: scores[1,4420,2] + boxes[1,4420,4]
 fn detect_face(sess: &mut Session, img: &image::RgbImage) -> Option<([f32; 4], f32)> {
     const W: u32 = 320;
     const H: u32 = 240;
@@ -200,13 +264,20 @@ fn detect_face(sess: &mut Session, img: &image::RgbImage) -> Option<([f32; 4], f
     Some((best_box, best))
 }
 
-// ── 106-point MobileNetV1 landmark model ────────────────────────────────────
-// In:  [1,3,192,192] f32 normalised (p-127.5)/127.5  → [-1, 1]
-// Out: [1,212] f32 interleaved (x0,y0,x1,y1,...) in [-1,1] relative to crop.
-//      Convert: coord = (raw + 1) / 2 * crop_dim + crop_offset
-fn detect_landmarks(sess: &mut Session, img: &image::RgbImage, bbox: [f32; 4]) -> Option<Vec<[f32; 2]>> {
+// ── MediaPipe face landmark model ─────────────────────────────────────────────
+// In:  [1, 256, 256, 3] NHWC, float [0,1]
+// Out: [0] Identity [1,1,1,1434] — 478 landmarks × (x,y,z) normalized in crop [0,1]
+//      [1] Identity_1 [1,1,1,1]  — face presence score
+//
+// Returns: (landmarks[478][3], crop_x1, crop_y1, crop_w, crop_h) in image pixels.
+// Landmark x/y are normalized [0,1] within the crop; z is relative depth.
+fn detect_landmarks_mp(
+    sess: &mut Session,
+    img:  &image::RgbImage,
+    bbox: [f32; 4],
+) -> Option<(Vec<[f32; 3]>, u32, u32, u32, u32)> {
     let (iw, ih) = img.dimensions();
-    let m = 0.15_f32;
+    let m = 0.20_f32;
     let dx = (bbox[2] - bbox[0]) * m;
     let dy = (bbox[3] - bbox[1]) * m;
     let x1 = ((bbox[0] - dx) * iw as f32).max(0.0) as u32;
@@ -218,118 +289,112 @@ fn detect_landmarks(sess: &mut Session, img: &image::RgbImage, bbox: [f32; 4]) -
     let ch = y2 - y1;
 
     let crop = imageops::crop_imm(img, x1, y1, cw, ch).to_image();
-    const LW: u32 = 192;
-    const LH: u32 = 192;
-    let rs = imageops::resize(&crop, LW, LH, imageops::FilterType::Nearest);
+    let rs = imageops::resize(&crop, 256, 256, imageops::FilterType::Nearest);
     let raw = rs.as_raw();
-    let n = (LW * LH) as usize;
-    let mut data = vec![0f32; 3 * n];
-    for i in 0..n {
-        data[i]         = (raw[i * 3]     as f32 - 127.5) / 127.5;
-        data[n + i]     = (raw[i * 3 + 1] as f32 - 127.5) / 127.5;
-        data[2 * n + i] = (raw[i * 3 + 2] as f32 - 127.5) / 127.5;
+
+    // NHWC [1, 256, 256, 3] normalized [0, 1]
+    let n_px = 256 * 256_usize;
+    let mut data = vec![0f32; n_px * 3];
+    for i in 0..n_px {
+        data[i * 3]     = raw[i * 3]     as f32 / 255.0;
+        data[i * 3 + 1] = raw[i * 3 + 1] as f32 / 255.0;
+        data[i * 3 + 2] = raw[i * 3 + 2] as f32 / 255.0;
     }
-    let arr = Array4::from_shape_vec([1, 3, LH as usize, LW as usize], data).ok()?;
+    let arr = Array4::from_shape_vec([1, 256, 256, 3], data).ok()?;
     let t = TensorRef::<f32>::from_array_view(arr.view()).ok()?;
     let outs = sess.run(ort::inputs![t]).ok()?;
 
-    let (_, flat) = outs[0].try_extract_tensor::<f32>().ok()?;
-    if flat.len() < 212 { return None; }
+    // Check face presence
+    let (_, presence) = outs[1].try_extract_tensor::<f32>().ok()?;
+    if presence[0] < 0.5 { return None; }
 
-    // Output is interleaved [x0,y0,...] in [-1,1]; map back to pixel space
-    Some(
-        (0..106)
-            .map(|i| [
-                (flat[i * 2]     + 1.0) / 2.0 * cw as f32 + x1 as f32,
-                (flat[i * 2 + 1] + 1.0) / 2.0 * ch as f32 + y1 as f32,
-            ])
-            .collect(),
-    )
+    let (_, flat) = outs[0].try_extract_tensor::<f32>().ok()?;
+    if flat.len() < 1434 { return None; }
+
+    // 478 landmarks, each (x, y, z) normalized to [0,1] within the 256×256 crop
+    let lmks: Vec<[f32; 3]> = (0..478)
+        .map(|i| [flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2]])
+        .collect();
+
+    Some((lmks, x1, y1, cw, ch))
 }
 
-// ── Geometry → blendshapes ──────────────────────────────────────────────────
-// InsightFace 2D-106 confirmed layout (from official markup image):
-//  0-32   face contour (non-sequential oval)
-//  33-42  left eyebrow  (subject's right, left in image)
-//  43-51  left eye      (subject's right)
-//  52-71  mouth         (outer 52-63, inner 64-71)
-//  72-86  nose          (bridge 72-73, tip ~78, nostrils 79-86)
-//  87-96  right eyebrow (subject's left, right in image)
-//  97-105 right eye     (subject's left)
-fn blendshapes(pts: Vec<[f32; 2]>, bbox: [f32; 4], iw: u32, ih: u32, ts: u64) -> TrackingResponce {
+// ── MediaPipe blendshapes model ───────────────────────────────────────────────
+// In:  [1, 146, 2] — 146 selected landmark (x, y) in crop-normalized [0,1]
+// Out: [52] — blend shape coefficients [0,1]; index 0 is _neutral (skipped)
+fn compute_blendshapes(sess: &mut Session, lmks: &[[f32; 3]]) -> Vec<Shape> {
+    let mut bs_data = vec![0f32; 146 * 2];
+    for (i, &idx) in BS_IDXS.iter().enumerate() {
+        if idx < lmks.len() {
+            bs_data[i * 2]     = lmks[idx][0];
+            bs_data[i * 2 + 1] = lmks[idx][1];
+        }
+    }
+    let arr = match Array3::from_shape_vec([1, 146, 2], bs_data) {
+        Ok(a) => a,
+        Err(_) => return vec![],
+    };
+    let t = match TensorRef::<f32>::from_array_view(arr.view()) {
+        Ok(t) => t,
+        Err(_) => return vec![],
+    };
+    let outs = match sess.run(ort::inputs![t]) {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+    let (_, vals) = match outs[0].try_extract_tensor::<f32>() {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    // Skip index 0 (_neutral); map remaining 51 to named shapes
+    (1..vals.len().min(52))
+        .map(|i| Shape {
+            k: BS_NAMES[i].to_string(),
+            v: (vals[i] as f64).clamp(0.0, 1.0),
+        })
+        .collect()
+}
+
+// ── Head pose from MediaPipe 478 landmarks ────────────────────────────────────
+// Key indices (MediaPipe face mesh topology):
+//   nose tip:         4     left cheek:  234   right cheek:  454
+//   chin:           152     left eye outer:  33  right eye outer: 263
+fn head_pose(
+    lmks: &[[f32; 3]],
+    cx: u32, cy: u32, cw: u32, ch: u32,
+    iw: u32, ih: u32,
+) -> (f32, f32, f32, f32, f32, f32) {
     let fw = iw as f32;
     let fh = ih as f32;
-    let fcx = (bbox[0] + bbox[2]) / 2.0 * fw;
-    let fcy = (bbox[1] + bbox[3]) / 2.0 * fh;
-    let face_w = (bbox[2] - bbox[0]) * fw;
-    let face_h = (bbox[3] - bbox[1]) * fh;
 
-    let pos_x = (fcx - fw / 2.0) / fw * 20.0;
-    let pos_y = (fh / 2.0 - fcy) / fh * 20.0;
-    let pos_z = ((fh * 0.3 / face_h.max(1.0)) - 1.0) * 8.0;
+    // Map crop-normalized [0,1] landmark to image pixel coords
+    let px = |i: usize| lmks[i][0] * cw as f32 + cx as f32;
+    let py = |i: usize| lmks[i][1] * ch as f32 + cy as f32;
 
-    // Roll: angle between left ear (pt 1) and right ear (pt 17)
-    let roll = if pts.len() > 17 {
-        (pts[1][1] - pts[17][1]).atan2(pts[17][0] - pts[1][0]).to_degrees()
-    } else { 0.0 };
+    let nose_x  = px(4);
+    let nose_y  = py(4);
+    let l_eye_x = px(33);  let l_eye_y = py(33);
+    let r_eye_x = px(263); let r_eye_y = py(263);
+    let l_chk_x = px(234); let l_chk_y = py(234);
+    let r_chk_x = px(454); let r_chk_y = py(454);
+    let chin_y  = py(152);
 
-    // Nose tip ≈ pt 78 (middle of nose range 72-86)
-    let nose = pts.get(78).copied().unwrap_or([fcx, fcy]);
-    let yaw   = -(nose[0] - fcx) / face_w.max(1.0) * 55.0;
+    let face_cx = (l_chk_x + r_chk_x) / 2.0;
+    let face_cy = (l_chk_y + r_chk_y) / 2.0;
+    let face_w  = ((r_chk_x - l_chk_x).powi(2) + (r_chk_y - l_chk_y).powi(2)).sqrt();
+    let eye_cy  = (l_eye_y + r_eye_y) / 2.0;
+    let face_h  = (chin_y - eye_cy).max(1.0);
 
-    // Eye centres: left eye in image = 43-51, right eye in image = 97-105
-    let right_ec = if pts.len() > 51 { midpt(pts[44], pts[49]) } else { [fcx, fcy] };
-    let left_ec  = if pts.len() > 105 { midpt(pts[98], pts[103]) } else { [fcx, fcy] };
-    let eye_y  = (right_ec[1] + left_ec[1]) / 2.0;
-    let pitch  = -(nose[1] - (eye_y + pts[16][1]) / 2.0) / face_h.max(1.0) * 55.0;
+    let roll  = -(l_eye_y - r_eye_y).atan2(r_eye_x - l_eye_x).to_degrees();
+    let yaw   = -(nose_x - face_cx) / face_w.max(1.0) * 55.0;
+    let pitch = -(nose_y - (eye_cy + face_h * 0.3)) / face_h * 55.0;
 
-    // Eye Aspect Ratio → blink
-    // Left eye in image (subject right): corners 43/51, top 46, bot 49
-    let r_blink = if pts.len() > 51 {
-        (1.0 - ear(pts[43], pts[51], pts[46], pts[49])).clamp(0.0, 1.0)
-    } else { 0.0 };
-    // Right eye in image (subject left): corners 97/105, top 100, bot 103
-    let l_blink = if pts.len() > 105 {
-        (1.0 - ear(pts[97], pts[105], pts[100], pts[103])).clamp(0.0, 1.0)
-    } else { 0.0 };
+    let pos_x = (face_cx - fw / 2.0) / fw * 20.0;
+    let pos_y = (fh / 2.0 - face_cy) / fh * 20.0;
+    let pos_z = ((fh * 0.3 / face_h) - 1.0) * 8.0;
 
-    // Jaw open: inner mouth top (pt 66) vs inner bottom (pt 70)
-    let jaw_open = if pts.len() > 71 {
-        (dist(pts[66], pts[70]) / face_h.max(1.0) * 6.0).clamp(0.0, 1.0)
-    } else { 0.0 };
-
-    // Smile: outer mouth corners (52, 58) vs centre bottom (61)
-    let smile = if pts.len() > 62 {
-        let corner_y = (pts[52][1] + pts[58][1]) / 2.0;
-        ((pts[61][1] - corner_y) / face_h.max(1.0) * 10.0).clamp(-1.0, 1.0)
-    } else { 0.0 };
-
-    // Brows: left brow mid ≈ pt 37, right brow mid ≈ pt 91
-    let brow_ref = (left_ec[1] + right_ec[1]) / 2.0;
-    let lb = if pts.len() > 42 {
-        ((brow_ref - pts[37][1]) / face_h.max(1.0) * 8.0 + 0.5).clamp(0.0, 1.0)
-    } else { 0.5 };
-    let rb = if pts.len() > 96 {
-        ((brow_ref - pts[91][1]) / face_h.max(1.0) * 8.0 + 0.5).clamp(0.0, 1.0)
-    } else { 0.5 };
-
-    TrackingResponce {
-        timestamp: ts, hotkey: 0, face_found: true,
-        rotation: Cords { x: pitch as f64, y: yaw as f64, z: roll as f64 },
-        position: Cords { x: pos_x as f64, y: pos_y as f64, z: pos_z as f64 },
-        eye_left: Cords { x: 0.0, y: 0.0, z: 0.0 },
-        blend_shapes: vec![
-            Shape { k: "EyeBlinkLeft".into(),      v: l_blink as f64 },
-            Shape { k: "EyeBlinkRight".into(),     v: r_blink as f64 },
-            Shape { k: "JawOpen".into(),            v: jaw_open as f64 },
-            Shape { k: "MouthSmileLeft".into(),    v: smile.max(0.0) as f64 },
-            Shape { k: "MouthSmileRight".into(),   v: smile.max(0.0) as f64 },
-            Shape { k: "MouthFrownLeft".into(),    v: (-smile).max(0.0) as f64 },
-            Shape { k: "MouthFrownRight".into(),   v: (-smile).max(0.0) as f64 },
-            Shape { k: "BrowOuterUpLeft".into(),   v: lb as f64 },
-            Shape { k: "BrowOuterUpRight".into(),  v: rb as f64 },
-        ],
-    }
+    (pitch, yaw, roll, pos_x, pos_y, pos_z)
 }
 
 fn no_face(ts: u64) -> TrackingResponce {
@@ -340,14 +405,4 @@ fn no_face(ts: u64) -> TrackingResponce {
         eye_left: Cords { x: 0.0, y: 0.0, z: 0.0 },
         blend_shapes: vec![],
     }
-}
-
-fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
-    ((a[0]-b[0]).powi(2) + (a[1]-b[1]).powi(2)).sqrt()
-}
-fn midpt(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
-    [(a[0]+b[0])/2.0, (a[1]+b[1])/2.0]
-}
-fn ear(lc: [f32;2], rc: [f32;2], top: [f32;2], bot: [f32;2]) -> f32 {
-    (dist(top, bot) / dist(lc, rc).max(0.001) / 0.28).clamp(0.0, 1.0)
 }
