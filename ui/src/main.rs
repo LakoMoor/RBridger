@@ -1181,41 +1181,42 @@ fn config_editor_ui(
 
     // Left panel width: 38% of available, clamped to [130, 220]
     let left_w = (avail_w * 0.38).clamp(130.0, 220.0);
-    let right_w = (avail_w - left_w - 12.0).max(100.0);
+    let right_w = (avail_w - left_w - 8.0).max(100.0);
 
     ui.horizontal(|ui| {
-        // Left: scrollable param list
-        ui.vertical(|ui| {
-            ui.set_width(left_w);
-            egui::ScrollArea::vertical()
-                .id_salt("param_list")
-                .max_height(avail_h)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_min_width(left_w - 8.0);
-                    for i in 0..ed.params.len() {
-                        let sel = ed.selected == Some(i);
-                        let col = if sel { Color32::WHITE } else { Color32::from_gray(210) };
-                        if ui.selectable_label(
-                            sel,
-                            RichText::new(&ed.params[i].name).monospace().small().color(col),
-                        ).clicked() && !sel {
-                            ed.apply_edit();
-                            ed.select(i);
+        // Left: param list — explicit size so it fills full height
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_w, avail_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("param_list")
+                    .show(ui, |ui| {
+                        ui.set_min_width(left_w - 8.0);
+                        for i in 0..ed.params.len() {
+                            let sel = ed.selected == Some(i);
+                            let col = if sel { Color32::WHITE } else { Color32::from_gray(210) };
+                            if ui.selectable_label(
+                                sel,
+                                RichText::new(&ed.params[i].name).monospace().small().color(col),
+                            ).clicked() && !sel {
+                                ed.apply_edit();
+                                ed.select(i);
+                            }
                         }
-                    }
-                });
-        });
+                    });
+            }
+        );
 
         ui.separator();
 
-        // Right: edit form + variables reference
-        ui.vertical(|ui| {
-        ui.set_min_width(right_w);
+        // Right: edit form + variables reference — explicit size so it fills full height
+        ui.allocate_ui_with_layout(
+            egui::vec2(right_w, avail_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
         egui::ScrollArea::vertical()
             .id_salt("editor_right")
-            .max_height(avail_h)
-            .auto_shrink([false, false])
             .show(ui, |ui| {
                 if ed.selected.is_none() {
                     ui.add_space(8.0);
@@ -1314,8 +1315,8 @@ fn config_editor_ui(
                         ui.end_row();
                     }
                 });
-            });
-        }); // right vertical
+            }); // ScrollArea editor_right
+            }); // allocate_ui right panel
     });
 }
 
