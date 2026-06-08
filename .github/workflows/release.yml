@@ -79,6 +79,8 @@ jobs:
             echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           else
             git commit -m "chore: bump version to ${{ steps.ver.outputs.version }} [skip ci]"
+            git fetch origin master
+            git rebase origin/master
             git push origin HEAD:master
             SHA=$(git rev-parse HEAD)
             echo "sha=$SHA" >> "$GITHUB_OUTPUT"
