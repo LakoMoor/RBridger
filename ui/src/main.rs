@@ -2,10 +2,11 @@
 
 use std::{
     fs,
+    io::{Read, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
     thread,
@@ -30,8 +31,18 @@ const OVROG_TEMPLATE: &str = include_str!("../../configs/ovrog.json");
 
 #[derive(Clone)]
 struct UpdateInfo {
-    version: String,
-    url:     String,
+    version:      String,
+    url:          String,           // release page (fallback link)
+    download_url: Option<String>,   // direct asset download
+}
+
+#[derive(Clone, PartialEq)]
+enum UpdateDlState {
+    Idle,
+    Downloading(f32),  // 0.0 – 1.0
+    Installing,
+    Done,
+    Failed(String),
 }
 
 fn parse_ver(v: &str) -> (u32, u32, u32) {
@@ -49,11 +60,142 @@ fn check_for_update() -> Option<UpdateInfo> {
     let tag  = json["tag_name"].as_str()?;
     let html = json["html_url"].as_str()?;
     let version = tag.trim_start_matches('v').to_string();
-    if parse_ver(&version) > parse_ver(VERSION) {
-        Some(UpdateInfo { version, url: html.to_string() })
-    } else {
-        None
+    if parse_ver(&version) <= parse_ver(VERSION) { return None; }
+
+    let ext = if cfg!(target_os = "macos") { ".dmg" }
+              else if cfg!(windows)         { ".exe" }
+              else                          { ".deb" };
+    let download_url = json["assets"].as_array()
+        .and_then(|a| a.iter().find(|x| x["name"].as_str().map_or(false, |n| n.ends_with(ext))))
+        .and_then(|x| x["browser_download_url"].as_str())
+        .map(|s| s.to_string());
+
+    Some(UpdateInfo { version, url: html.to_string(), download_url })
+}
+
+fn download_and_install(url: String, tx: Sender<UpdateDlState>) {
+    let ext = if cfg!(target_os = "macos") { "dmg" }
+              else if cfg!(windows)         { "exe" }
+              else                          { "deb" };
+    let tmp = std::env::temp_dir().join(format!("rbridger_update.{ext}"));
+
+    let _ = tx.send(UpdateDlState::Downloading(0.0));
+
+    let resp = match ureq::get(&url).call() {
+        Ok(r) => r,
+        Err(e) => { let _ = tx.send(UpdateDlState::Failed(e.to_string())); return; }
+    };
+    let total = resp.header("content-length")
+        .and_then(|h| h.parse::<u64>().ok())
+        .unwrap_or(1);
+
+    let mut reader = resp.into_reader();
+    let mut file = match fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => { let _ = tx.send(UpdateDlState::Failed(format!("write: {e}"))); return; }
+    };
+
+    let mut downloaded = 0u64;
+    let mut buf = [0u8; 65536];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if file.write_all(&buf[..n]).is_err() { break; }
+                downloaded += n as u64;
+                let _ = tx.send(UpdateDlState::Downloading(downloaded as f32 / total as f32));
+            }
+            Err(_) => break,
+        }
     }
+    drop(file);
+
+    let _ = tx.send(UpdateDlState::Installing);
+    install_update(&tmp, tx);
+}
+
+fn install_update(tmp: &std::path::Path, tx: Sender<UpdateDlState>) {
+    #[cfg(target_os = "macos")]
+    {
+        // Attach DMG
+        let out = match std::process::Command::new("hdiutil")
+            .args(["attach", tmp.to_str().unwrap_or(""), "-nobrowse", "-quiet"])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => { let _ = tx.send(UpdateDlState::Failed(format!("hdiutil: {e}"))); return; }
+        };
+        // Parse mount point (last tab-separated column of output lines)
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let vol = stdout.lines()
+            .filter_map(|l| l.split('\t').last().map(str::trim))
+            .filter(|s| s.starts_with("/Volumes/"))
+            .last()
+            .map(|s| s.to_string());
+        let Some(vol) = vol else {
+            let _ = tx.send(UpdateDlState::Failed("DMG mount failed — no volume found".into()));
+            return;
+        };
+        let src = std::path::PathBuf::from(&vol).join("RBridger.app");
+        if !src.exists() {
+            let _ = std::process::Command::new("hdiutil").args(["detach", &vol, "-quiet"]).status();
+            let _ = tx.send(UpdateDlState::Failed("RBridger.app not found in DMG".into()));
+            return;
+        }
+        // Destination: directory of current .app bundle
+        let dst = std::env::current_exe().ok()
+            .and_then(|p| p.ancestors()
+                .find(|a| a.extension().map_or(false, |e| e == "app"))
+                .map(|a| a.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("/Applications/RBridger.app"));
+        let _ = fs::remove_dir_all(&dst);
+        let ok = std::process::Command::new("cp")
+            .args(["-R", src.to_str().unwrap_or(""), dst.to_str().unwrap_or("")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::process::Command::new("hdiutil").args(["detach", &vol, "-quiet"]).status();
+        if ok {
+            let _ = tx.send(UpdateDlState::Done);
+            thread::sleep(std::time::Duration::from_millis(600));
+            let _ = std::process::Command::new("open").arg(&dst).spawn();
+            std::process::exit(0);
+        } else {
+            let _ = tx.send(UpdateDlState::Failed("Failed to copy app bundle".into()));
+        }
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try pkexec dpkg -i (polkit GUI elevation)
+        let ok = std::process::Command::new("pkexec")
+            .args(["dpkg", "-i", tmp.to_str().unwrap_or("")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            let _ = tx.send(UpdateDlState::Done);
+            thread::sleep(std::time::Duration::from_millis(400));
+            let exe = std::env::current_exe().unwrap_or_default();
+            let _ = std::process::Command::new(&exe).spawn();
+            std::process::exit(0);
+        }
+        // Fallback: open with system package manager (e.g. GDebi)
+        let _ = std::process::Command::new("xdg-open").arg(tmp).spawn();
+        let _ = tx.send(UpdateDlState::Done);
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = tx.send(UpdateDlState::Done);
+        let _ = std::process::Command::new(tmp).spawn();
+        std::process::exit(0);
+    }
+
+    #[allow(unreachable_code)]
+    { let _ = tx.send(UpdateDlState::Failed("Auto-update not supported on this platform".into())); }
 }
 
 // ── Tracking source ───────────────────────────────────────────────────────────
@@ -319,6 +461,8 @@ struct App {
     update_rx:       Option<Receiver<Option<UpdateInfo>>>,
     update_info:     Option<UpdateInfo>,
     update_open:     bool,
+    update_dl_state: UpdateDlState,
+    update_dl_rx:    Option<Receiver<UpdateDlState>>,
 }
 
 impl App {
@@ -392,9 +536,11 @@ impl App {
             mirror,
             afk_mode,
             last_window_size: None,
-            update_rx:   Some(update_rx),
-            update_info: None,
-            update_open: false,
+            update_rx:       Some(update_rx),
+            update_info:     None,
+            update_open:     false,
+            update_dl_state: UpdateDlState::Idle,
+            update_dl_rx:    None,
         }
     }
 
@@ -583,9 +729,24 @@ impl eframe::App for App {
             }
         }
 
-        // Update available popup
+        // Poll download/install progress
+        if let Some(rx) = &self.update_dl_rx {
+            while let Ok(state) = rx.try_recv() {
+                self.update_dl_state = state;
+            }
+            if matches!(self.update_dl_state, UpdateDlState::Done | UpdateDlState::Failed(_)) {
+                self.update_dl_rx = None;
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
+        // Update popup
         if self.update_open {
             if let Some(info) = self.update_info.clone() {
+                let dl_state = self.update_dl_state.clone();
+                let mut start_dl: Option<String> = None;
+
                 egui::Window::new("Update Available")
                     .collapsible(false)
                     .resizable(false)
@@ -594,19 +755,72 @@ impl eframe::App for App {
                     .show(ctx, |ui| {
                         ui.add_space(4.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(egui::RichText::new(format!("Version {} is available!", info.version)).strong());
-                            ui.add_space(2.0);
-                            ui.label(egui::RichText::new(format!("You are running v{VERSION}"))
+                            ui.label(egui::RichText::new(
+                                format!("Version {} is available!", info.version)).strong());
+                            ui.label(egui::RichText::new(format!("You are on v{VERSION}"))
                                 .small().color(egui::Color32::from_gray(150)));
                         });
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(6.0);
-                        ui.vertical_centered(|ui| {
-                            ui.hyperlink_to("Open release page", &info.url);
-                        });
+
+                        match &dl_state {
+                            UpdateDlState::Idle => {
+                                ui.vertical_centered(|ui| {
+                                    if info.download_url.is_some() {
+                                        if ui.button("  Update Now  ").clicked() {
+                                            start_dl = info.download_url.clone();
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                    ui.hyperlink_to("Release page", &info.url);
+                                });
+                            }
+                            UpdateDlState::Downloading(p) => {
+                                ui.vertical_centered(|ui| {
+                                    ui.label("Downloading…");
+                                    ui.add_space(4.0);
+                                    let w = ui.available_width().min(260.0);
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(w, 8.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(50));
+                                    let fill = egui::Rect::from_min_size(
+                                        rect.min, egui::vec2(rect.width() * p, rect.height()));
+                                    ui.painter().rect_filled(fill, 4.0, egui::Color32::from_rgb(70, 145, 230));
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new(format!("{:.0}%", p * 100.0))
+                                        .small().color(egui::Color32::from_gray(150)));
+                                });
+                            }
+                            UpdateDlState::Installing => {
+                                ui.vertical_centered(|ui| {
+                                    ui.label("Installing…");
+                                });
+                            }
+                            UpdateDlState::Done => {
+                                ui.vertical_centered(|ui| {
+                                    ui.label(egui::RichText::new("Done! Relaunching…")
+                                        .color(egui::Color32::from_rgb(80, 200, 100)));
+                                });
+                            }
+                            UpdateDlState::Failed(e) => {
+                                ui.vertical_centered(|ui| {
+                                    ui.label(egui::RichText::new(format!("Error: {e}"))
+                                        .small().color(egui::Color32::from_rgb(220, 80, 80)));
+                                    ui.add_space(4.0);
+                                    ui.hyperlink_to("Download manually", &info.url);
+                                });
+                            }
+                        }
                         ui.add_space(4.0);
                     });
+
+                if let Some(url) = start_dl {
+                    let (tx, rx) = mpsc::channel();
+                    self.update_dl_state = UpdateDlState::Downloading(0.0);
+                    self.update_dl_rx = Some(rx);
+                    thread::spawn(move || download_and_install(url, tx));
+                }
             }
         }
 
